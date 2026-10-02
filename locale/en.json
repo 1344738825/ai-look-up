@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AI Look-Up",
+    "description": "Detects aimless grinding (repeated commands, failure loops, long runs with no output) and injects mid-run self-review nudges plus real local-time anchors."
+  }
+}

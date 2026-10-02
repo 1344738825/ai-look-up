@@ -1,0 +1,4 @@
+- insert:
+    - id: ai-look-up
+      name: 'ai-look-up'
+      config: {}

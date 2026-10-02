@@ -1,0 +1,18 @@
+{
+  "name": "ai-look-up",
+  "version": "0.3.0",
+  "description": "AI Look-Up: mid-run self-review nudges and real local-time anchors for aimless AI coding agents (ZCode plugin + DeepSeek Harness bundle).",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

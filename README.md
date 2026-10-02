@@ -10,11 +10,11 @@ AI 长任务里最常见的浪费不是做错,而是**空跑**:换名字重跑�
 
 把本仓库克隆或下载解压,在客户端中打开 **插件市场 → 添加 → 添加插件市场**,选择仓库目录(根目录即市场清单 `marketplace.json` 所在),然后在 **个人 → ai-look-up-market** 中安装「AI 抬头」。
 
-**方式二:Git 仓库直装**
+**方式二:Git 仓库直装(DeepSeek Harness)**
 
-部分客户端(如 DeepSeek Harness 的插件页)支持直接粘贴 Git 仓库地址安装——本仓库根目录自带 `.zcode-plugin/plugin.json`,可被直接识别为插件。
+DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本仓库同时是一个 **cordis bundle**(`package.json` 声明 `dsh.bundle.patch`),会以 Host 插件形式安装,通过 `tools/result` / `session/event` 事件观察行为节奏,经 `agent.inject()` 注入提醒,无需 Python。
 
-**要求:** 系统可用 `python` 命令(3.8+),钩子脚本依赖它运行;若可执行名不同,修改 `hooks/hooks.json` 中的 4 处 `python` 即可。
+**要求:** ZCode 安装方式需要系统可用 `python` 命令(3.8+),若可执行名不同,修改 `hooks/hooks.json` 中的 4 处 `python` 即可;dsh 安装方式无此要求(纯 JS)。
 
 ## 工作原理
 
