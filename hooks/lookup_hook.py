@@ -31,6 +31,7 @@ import re
 import sys
 import tempfile
 import time
+import urllib.request
 
 PRODUCTIVE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "ApplyPatch"}
 
@@ -61,9 +62,29 @@ DEFAULTS = {
     # 本地时钟锚点:每 N 分钟注入一次真实本地时间,校准 AI 的时间感
     "clock_tick": True,
     "clock_tick_minutes": 10,
+    # 独立审查者:触发提醒时直调一次 OpenAI 兼容接口,用独立上下文判定是否空跑。
+    # 默认关闭;在配置文件里给出 llm_api_key 后启用(DeepSeek: api_base 保持默认
+    # https://api.deepseek.com,model deepseek-chat)。失败/超时回退静态清单。
+    "llm_review": False,
+    "llm_api_base": "https://api.deepseek.com",
+    "llm_api_key": "",
+    "llm_model": "deepseek-chat",
+    "llm_timeout_sec": 12,
+    "review_log_size": 12,
 }
 
-BOOL_KEYS = {"enabled", "stop_check", "clock_tick"}
+BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review"}
+
+REVIEW_SYSTEM = (
+    "你是 AI 编码代理的独立行为审查员。主代理看不到你的存在,你只依据给它的任务描述"
+    "与最近工具调用记录做判断。判断标准:最近的调用是否持续带来新信息、是否朝着任务"
+    "目标推进;同样的命令反复执行、长时间没有任何文件修改、连续失败后仍在重试,都是"
+    "空跑迹象。只输出一个 JSON 对象,不要输出任何其他文字:\n"
+    '{"verdict":"on-track|drifting|stuck","reason":"一句话依据","suggestion":"一句话建议"}\n'
+    "on-track=仍在正轨;drifting=有偏航/空转迹象;stuck=确认空跑或卡死。"
+)
+
+VERDICT_LABEL = {"on-track": "仍在正轨", "drifting": "有偏航迹象", "stuck": "空跑确认"}
 
 
 def load_config():
@@ -95,8 +116,10 @@ def load_config():
                 cfg[k] = raw.strip().lower() in ("1", "true", "yes", "on")
             elif isinstance(DEFAULTS[k], int):
                 cfg[k] = int(float(raw))
-            else:
+            elif isinstance(DEFAULTS[k], float):
                 cfg[k] = float(raw)
+            else:
+                cfg[k] = raw
         except Exception:
             pass
     return cfg
@@ -160,6 +183,9 @@ def new_state(sid, now):
         "prompt_resets": 0,
         "last_clock_tick_at": 0.0,
         "clock_ticks": 0,
+        "recent_log": [],
+        "last_goal": "",
+        "reviews": 0,
     }
 
 
@@ -318,6 +344,89 @@ def clock_text(state, now):
     ).format(h=local_hm(now), hs=local_hm(state.get("started_at", now)), m=fmt_minutes(state, now))
 
 
+def build_review_material(state, cfg, now, kind, detail):
+    log_lines = [
+        "{i}. [{t}{ok}] {b}".format(
+            i=i + 1, t=e.get("tool", "?"),
+            ok="" if e.get("ok") else " ✗失败",
+            b=e.get("brief") or "(无参数摘要)")
+        for i, e in enumerate(state.get("recent_log", [])[-cfg["review_log_size"]:])
+    ]
+    parts = [
+        "【审查材料】触发原因: " + kind,
+        "【原始任务】" + (state.get("last_goal") or "(未捕获到任务描述)"),
+        "【统计】本段运行 {m:.0f} 分钟,共 {c} 次工具调用,文件修改 {e} 次,"
+        "当前连续失败 {f} 次,累计失败 {t} 次。".format(
+            m=fmt_minutes(state, now), c=state.get("tool_calls", 0),
+            e=state.get("edits", 0), f=state.get("fail_streak", 0),
+            t=state.get("total_failures", 0)),
+        "【最近工具调用(旧→新)】",
+    ]
+    parts.extend(log_lines)
+    if detail:
+        parts.append("【触发细节】" + detail)
+    return "\n".join(parts)
+
+
+def call_llm_review(state, cfg, now, kind, detail):
+    """直调一次 OpenAI 兼容接口,返回解析后的 verdict dict;任何失败返回 None。"""
+    api_key = cfg.get("llm_api_key") or ""
+    if not api_key:
+        return None
+    material = build_review_material(state, cfg, now, kind, detail)
+    payload = json.dumps({
+        "model": cfg.get("llm_model") or "deepseek-chat",
+        "temperature": 0,
+        "max_tokens": 200,
+        "messages": [
+            {"role": "system", "content": REVIEW_SYSTEM},
+            {"role": "user", "content": material},
+        ],
+    }).encode("utf-8")
+    base = (cfg.get("llm_api_base") or "https://api.deepseek.com").rstrip("/")
+    req = urllib.request.Request(
+        base + "/chat/completions", data=payload, method="POST",
+        headers={
+            "Authorization": "Bearer " + api_key,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg.get("llm_timeout_sec", 12)) as resp:
+            data = json.loads(resp.read().decode("utf-8", "replace"))
+        text = data["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        obj = json.loads(text[start:end + 1])
+    except Exception:
+        return None
+    if obj.get("verdict") not in VERDICT_LABEL:
+        return None
+    return {
+        "verdict": obj["verdict"],
+        "reason": str(obj.get("reason", ""))[:300],
+        "suggestion": str(obj.get("suggestion", ""))[:300],
+    }
+
+
+def finalize_text(state, cfg, now, kind, detail, static_text):
+    """提醒发出前的最后一站:llm_review 开启时追加独立审查结论,失败回退静态文案。"""
+    if not cfg.get("llm_review"):
+        return static_text
+    verdict = call_llm_review(state, cfg, now, kind, detail)
+    if verdict is None:
+        return static_text
+    state["reviews"] = state.get("reviews", 0) + 1
+    return (static_text + "\n\n🔎 【AI 抬头 · 独立审查】判定: " + VERDICT_LABEL[verdict["verdict"]]
+            + "\n审查依据: " + (verdict["reason"] or "(未给出)")
+            + "\n审查建议: " + (verdict["suggestion"] or "(未给出)")
+            + "\n请针对以上结论,用一句话决定:继续 / 换方法 / 先向用户汇报。")
+
+
 def post_use_output(text):
     return {
         "hookSpecificOutput": {
@@ -361,6 +470,9 @@ def handle_post_use(cfg, data, state, now):
             recent = state.get("recent_cmds", [])
             recent.append({"t": now, "n": n, "r": r})
             state["recent_cmds"] = recent[-8:]
+    log = state.get("recent_log", [])
+    log.append({"tool": tool, "brief": (extract_cmd(data) or "")[:100], "ok": True})
+    state["recent_log"] = log[-cfg["review_log_size"]:]
 
     # ── 触发器按证据强度排序,命中第一个即返回 ──
     # 0) 完全相同的命令原样重复(参数级,证据最强)
@@ -378,7 +490,10 @@ def handle_post_use(cfg, data, state, now):
                 cfg["cooldown_sec"],
             )
             if text:
-                return post_use_output(text)
+                return post_use_output(finalize_text(
+                    state, cfg, now, "exact-repeat",
+                    "原样命令重复 {n} 次: {cmd}".format(n=hit["count"], cmd=hit["raw"][:100]),
+                    text))
     # 1) 重复命令空转(归一化相似)
     if state["calls_since_reminder"] >= cfg["repeat_min_calls"]:
         hit = repeat_hit(state, cfg)
@@ -394,7 +509,10 @@ def handle_post_use(cfg, data, state, now):
                 cfg["cooldown_sec"],
             )
             if text:
-                return post_use_output(text)
+                return post_use_output(finalize_text(
+                    state, cfg, now, "repeat-cmds",
+                    "相似命令重复 {n} 次: {p}".format(n=hit["count"], p=hit["prefix"]),
+                    text))
     # 2) 会话超长且从未产出修改
     if (state["edits"] == 0
             and fmt_minutes(state, now) >= cfg["long_run_minutes"]
@@ -410,7 +528,10 @@ def handle_post_use(cfg, data, state, now):
             cfg["cooldown_sec"],
         )
         if text:
-            return post_use_output(text)
+            return post_use_output(finalize_text(
+                state, cfg, now, "long-run",
+                "运行 {m:.0f} 分钟零修改".format(m=fmt_minutes(state, now)),
+                text))
     # 3) 调用量大但期间零修改
     if (state["calls_since_reminder"] >= cfg["call_nudge_interval"]
             and state["edits_since_reminder"] == 0):
@@ -425,7 +546,10 @@ def handle_post_use(cfg, data, state, now):
             cfg["cooldown_sec"],
         )
         if text:
-            return post_use_output(text)
+            return post_use_output(finalize_text(
+                state, cfg, now, "no-output",
+                "{c} 次调用零修改".format(c=state["calls_since_reminder"]),
+                text))
     # 4) 本地时钟锚点(最低优先级:空跑提醒优先,且其刚发出 2 分钟内时钟静默)
     if cfg["clock_tick"] and now - state.get("last_reminder_at", 0.0) >= 120:
         tick_sec = cfg["clock_tick_minutes"] * 60
@@ -441,6 +565,10 @@ def handle_post_fail(cfg, data, state, now):
     state["last_event_at"] = now
     state["fail_streak"] += 1
     state["total_failures"] += 1
+    log = state.get("recent_log", [])
+    log.append({"tool": str(data.get("tool_name") or data.get("toolName") or "Unknown"),
+                "brief": (extract_cmd(data) or "")[:100], "ok": False})
+    state["recent_log"] = log[-cfg["review_log_size"]:]
     if state["fail_streak"] < cfg["fail_streak_threshold"]:
         return None
     if now - state.get("last_fail_reminder_at", 0.0) < cfg["fail_cooldown_sec"]:
@@ -461,14 +589,22 @@ def handle_post_fail(cfg, data, state, now):
     if state.get("reminders", 0) >= 3:
         text += "\n⚠️ 这已是本会话第 {n} 次提醒。请考虑完全放弃当前路径,直接向用户汇报。".format(
             n=state["reminders"] + 1)
+    streak = state["fail_streak"]
     state["fail_streak"] = 0
-    return post_fail_output(text)
+    return post_fail_output(finalize_text(
+        state, cfg, now, "fail-loop",
+        "连续失败 {n} 次".format(n=streak),
+        text))
 
 
 def handle_prompt(cfg, data, state, now):
     state["last_event_at"] = now
     state["prompt_resets"] += 1
     reset_stretch(state, now)
+    # 捕获任务描述,供独立审查者使用(尽力而为)
+    goal = data.get("prompt") or data.get("user_prompt") or ""
+    if isinstance(goal, str) and goal.strip():
+        state["last_goal"] = goal.strip()[:400]
     return None
 
 

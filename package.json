@@ -1,6 +1,6 @@
 {
   "name": "ai-look-up",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "AI Look-Up: mid-run self-review nudges and real local-time anchors for aimless AI coding agents (ZCode plugin + DeepSeek Harness bundle).",
   "private": true,
   "type": "module",

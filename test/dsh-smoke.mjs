@@ -5,11 +5,12 @@
 import assert from 'node:assert/strict';
 import { apply } from '../index.js';
 
-function makeHarness(config) {
+function makeHarness(config, services = {}) {
   const handlers = {};
   const ctx = {
     on(name, fn) { (handlers[name] ??= []).push(fn); },
     logger: { warn: (...a) => console.error('[warn]', ...a) },
+    ...services,
   };
   apply(ctx, config);
   const emit = (name, ...args) => {
@@ -149,6 +150,68 @@ const texts = (agent) =>
   assert.equal(message.role, 'user');
   assert.equal(message.source.kind, 'plugin:ai-look-up');
   console.log('PASS  inbox.prepend fallback receives a message object');
+}
+
+// 9) independent reviewer: a working llm service turns the nudge into a verdict
+{
+  const seen = [];
+  const fakeLlm = {
+    async *stream(options) {
+      seen.push(options);
+      yield { type: 'text', text: '{"verdict":"stuck","reason":"同样的命令反复执行且无新信息","suggestion":"换一种方法或先汇报"}' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+  const { emit, makeAgent } = makeHarness({}, { llm: fakeLlm });
+  const agent = makeAgent();
+  agent.session.requestHeader = () => ({ config: { provider: 'deepseek', model: 'deepseek-chat' } });
+  emit('agent/created', agent);
+  for (let i = 0; i < 6; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
+  for (let i = 0; i < 3; i++) emit('tools/result', exec(agent, 'Bash', { command: 'git status' }), { isError: false });
+  await new Promise((r) => setTimeout(r, 20));
+  const out = texts(agent);
+  assert(out.some((t) => t.includes('独立审查') && t.includes('空跑确认')), 'verdict must replace the static checklist');
+  assert.equal(seen.length, 1, 'exactly one reviewer call');
+  assert.equal(seen[0].provider, 'deepseek', 'reviewer follows the session provider');
+  assert.equal(seen[0].model, 'deepseek-chat', 'reviewer follows the session model');
+  assert.equal(seen[0].temperature, 0, 'reviewer runs at temperature 0');
+  assert(seen[0].messages[0].content[0].text.includes('git status'), 'review material includes the recent calls');
+  const last = agent.injected.at(-1);
+  assert.equal(last.role, 'user', 'verdict is still a proper UserMessage');
+  console.log('PASS  independent reviewer injects its verdict through the llm service');
+}
+
+// 10) reviewer failure falls back to the static checklist
+{
+  const fakeLlm = {
+    async *stream() {
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'boom', message: 'provider down' } } };
+    },
+  };
+  const { emit, makeAgent } = makeHarness({}, { llm: fakeLlm });
+  const agent = makeAgent();
+  agent.session.requestHeader = () => ({ config: { provider: 'deepseek', model: 'deepseek-chat' } });
+  emit('agent/created', agent);
+  for (let i = 0; i < 6; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
+  for (let i = 0; i < 3; i++) emit('tools/result', exec(agent, 'Bash', { command: 'git status' }), { isError: false });
+  await new Promise((r) => setTimeout(r, 20));
+  const out = texts(agent);
+  assert(out.some((t) => t.includes('中途自我审查') && t.includes('原样执行 3 次')), 'static checklist must be the fallback');
+  assert(!out.some((t) => t.includes('独立审查')), 'no verdict may be injected after a reviewer failure');
+  console.log('PASS  reviewer failure falls back to the static checklist');
+}
+
+// 11) without the llm service the static checklist is used immediately
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  for (let i = 0; i < 6; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
+  for (let i = 0; i < 3; i++) emit('tools/result', exec(agent, 'Bash', { command: 'git status' }), { isError: false });
+  assert.equal(agent.injected.length, 1, 'no async detour without llm');
+  assert(texts(agent).some((t) => t.includes('中途自我审查')), 'static checklist injected');
+  assert(!texts(agent).some((t) => t.includes('独立审查')), 'no reviewer verdict without llm');
+  console.log('PASS  no llm service means static checklist, no async detour');
 }
 
 console.log('ALL DSH SMOKE TESTS PASSED');

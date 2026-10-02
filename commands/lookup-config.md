@@ -31,6 +31,12 @@ argument-hint: "[要调整的参数=新值, 或留空查看]"
 | `stop_min_calls` | `40` | 结束审查要求的最低调用数 |
 | `clock_tick` | `true` | 定期注入真实本地时间,校准 AI 时间感 |
 | `clock_tick_minutes` | `10` | 时钟注入的间隔(分钟) |
+| `llm_review` | `false` | 触发提醒时用独立 LLM 上下文审查是否空跑 |
+| `llm_api_base` | `https://api.deepseek.com` | OpenAI 兼容接口地址 |
+| `llm_api_key` | 空 | 接口密钥,填写后审查才生效 |
+| `llm_model` | `deepseek-chat` | 审查用模型 |
+| `llm_timeout_sec` | `12` | 审查调用超时(秒),超时回退静态清单 |
+| `review_log_size` | `12` | 审查材料携带的最近调用条数 |
 
 **用户指令处理:**
 
