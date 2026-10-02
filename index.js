@@ -261,7 +261,6 @@ export function apply(ctx, config) {
       st.toolCalls += 1;
       st.callsSinceReminder += 1;
       st.byTool[tool] = (st.byTool[tool] ?? 0) + 1;
-      st.failStreak = 0;
 
       if (PRODUCTIVE_TOOLS.has(tool)) {
         st.edits += 1;
@@ -300,6 +299,8 @@ export function apply(ctx, config) {
           deliver(agent, ctx, text);
           return;
         }
+      } else {
+        st.failStreak = 0;
       }
 
       if (!cfg.enabled) return;
