@@ -13,6 +13,8 @@
  * - `agent.inject()`    mid-run context, enters the next admitted step
  */
 
+import { randomUUID } from 'node:crypto';
+
 const PRODUCTIVE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'ApplyPatch']);
 
 const DEFAULTS = {
@@ -165,13 +167,29 @@ const clockText = (state, now) => '🕐 【AI 抬头 · 本地时钟】当前本
   + ' 分钟。AI 对时间流逝的感觉不可靠:凡是要向用户预估或汇报耗时、判断是否超时,请一律以这个真实时钟为准,不要自己估算。';
 
 /**
+ * Build one injectable user message. `agent.inject()` and
+ * `agent.inbox.prepend()` both take a UserMessage; a bare string is stored
+ * verbatim as an `agent/inbox/spliced` payload that the session reader
+ * rejects (history load fails) and the live loop cannot interpret.
+ */
+function nudgeMessage(text) {
+  return {
+    id: randomUUID(),
+    role: 'user',
+    content: [{ type: 'text', text }],
+    source: { kind: 'plugin:ai-look-up' },
+  };
+}
+
+/**
  * Deliver a nudge. `agent.inject()` is the documented mid-run channel; the
- * inbox prepend is the fallback if the runtime rejects a plain string.
+ * inbox prepend is the fallback for agents without an inject entry point.
  */
 function deliver(agent, ctx, text) {
+  const message = nudgeMessage(text);
   try {
     if (typeof agent.inject === 'function') {
-      agent.inject(text);
+      agent.inject(message);
       return true;
     }
   } catch (error) {
@@ -179,7 +197,7 @@ function deliver(agent, ctx, text) {
   }
   try {
     if (agent.inbox && typeof agent.inbox.prepend === 'function') {
-      agent.inbox.prepend('next-step', text);
+      agent.inbox.prepend('next-step', message);
       return true;
     }
   } catch (error) {

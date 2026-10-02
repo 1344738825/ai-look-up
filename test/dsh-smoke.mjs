@@ -18,7 +18,7 @@ function makeHarness(config) {
   const makeAgent = () => ({
     session: {},
     injected: [],
-    inject(text) { this.injected.push(text); },
+    inject(message) { this.injected.push(message); },
     ctx: { effect(fn) { return typeof fn === 'function' ? fn() : undefined; } },
   });
   return { emit, makeAgent };
@@ -26,6 +26,10 @@ function makeHarness(config) {
 
 const exec = (agent, tool, input, extra = {}) =>
   ({ agent, name: tool, input, signal: { aborted: false }, ...extra });
+
+/** Flatten injected messages to their text, the caller-visible payload. */
+const texts = (agent) =>
+  agent.injected.map((m) => (Array.isArray(m?.content) ? m.content.map((b) => b.text).join('\n') : String(m)));
 
 // 1) three consecutive failures must fire the failure-loop reminder
 {
@@ -35,7 +39,7 @@ const exec = (agent, tool, input, extra = {}) =>
   for (let i = 0; i < 3; i++) {
     emit('tools/result', exec(agent, 'Bash', { command: 'python x.py' }), { isError: true });
   }
-  assert(agent.injected.some((t) => t.includes('失败循环')), '3 consecutive errors must inject');
+  assert(texts(agent).some((t) => t.includes('失败循环')), '3 consecutive errors must inject');
   console.log('PASS  consecutive failures inject failure-loop reminder');
 }
 
@@ -49,9 +53,9 @@ const exec = (agent, tool, input, extra = {}) =>
   emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
   emit('tools/result', exec(agent, 'Bash', { command: 'python x.py' }), { isError: true });
   emit('tools/result', exec(agent, 'Bash', { command: 'python x.py' }), { isError: true });
-  assert(!agent.injected.some((t) => t.includes('失败循环')), 'streak broken by success must not inject');
+  assert(!texts(agent).some((t) => t.includes('失败循环')), 'streak broken by success must not inject');
   emit('tools/result', exec(agent, 'Bash', { command: 'python x.py' }), { isError: true });
-  assert(agent.injected.some((t) => t.includes('失败循环')), '3 fresh failures after success must inject');
+  assert(texts(agent).some((t) => t.includes('失败循环')), '3 fresh failures after success must inject');
   console.log('PASS  success breaks the failure streak, fresh streak of 3 injects');
 }
 
@@ -62,7 +66,7 @@ const exec = (agent, tool, input, extra = {}) =>
   emit('agent/created', agent);
   for (let i = 0; i < 6; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
   for (let i = 0; i < 3; i++) emit('tools/result', exec(agent, 'Bash', { command: 'git status' }), { isError: false });
-  assert(agent.injected.some((t) => t.includes('中途自我审查') && t.includes('原样执行 3 次')), 'exact repeat must inject');
+  assert(texts(agent).some((t) => t.includes('中途自我审查') && t.includes('原样执行 3 次')), 'exact repeat must inject');
   console.log('PASS  exact-repeat trigger injects');
 }
 
@@ -72,7 +76,7 @@ const exec = (agent, tool, input, extra = {}) =>
   const agent = makeAgent();
   emit('agent/created', agent);
   emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
-  assert(agent.injected.some((t) => t.includes('本地时钟')), 'clock anchor must inject');
+  assert(texts(agent).some((t) => t.includes('本地时钟')), 'clock anchor must inject');
   console.log('PASS  local clock anchor injects');
 }
 
@@ -97,6 +101,54 @@ const exec = (agent, tool, input, extra = {}) =>
   for (let i = 0; i < 25; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
   assert.equal(agent.injected.length, 0, 'counters must reset on user message');
   console.log('PASS  user/message resets turn counters');
+}
+
+// 7) every injected nudge is a full dsh UserMessage, never a bare string
+{
+  const failingHarness = makeHarness({ clockTick: false });
+  const failing = failingHarness.makeAgent();
+  failingHarness.emit('agent/created', failing);
+  for (let i = 0; i < 3; i++) {
+    failingHarness.emit('tools/result', exec(failing, 'Bash', { command: 'python x.py' }), { isError: true });
+  }
+  const tickingHarness = makeHarness({ clockTickMinutes: 0 });
+  const ticking = tickingHarness.makeAgent();
+  tickingHarness.emit('agent/created', ticking);
+  tickingHarness.emit('tools/result', exec(ticking, 'Read', { file_path: 'a.txt' }), { isError: false });
+
+  const all = [...failing.injected, ...ticking.injected];
+  assert.equal(all.length, 2, 'expected one failure-loop nudge and one clock nudge');
+  const ids = new Set();
+  for (const m of all) {
+    assert.equal(typeof m, 'object', 'injected value must be a message object');
+    assert.equal(m.role, 'user', 'injected message role must be user');
+    assert.equal(typeof m.id, 'string');
+    assert(m.id.length > 0, 'injected message needs a non-empty id');
+    assert.equal(m.source.kind, 'plugin:ai-look-up', 'injected message needs a producer-owned source kind');
+    assert(Array.isArray(m.content) && m.content[0].type === 'text' && typeof m.content[0].text === 'string',
+      'injected message content must be a text block');
+    ids.add(m.id);
+  }
+  assert.equal(ids.size, all.length, 'message ids must be unique');
+  console.log('PASS  injected nudges are valid UserMessage objects with unique ids');
+}
+
+// 8) inbox fallback path also receives a message object
+{
+  const { emit, makeAgent } = makeHarness({ clockTickMinutes: 0 });
+  const agent = makeAgent();
+  delete agent.inject;
+  agent.prepended = [];
+  agent.inbox = { prepend(target, message) { agent.prepended.push([target, message]); } };
+  emit('agent/created', agent);
+  emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
+  assert.equal(agent.prepended.length, 1, 'fallback must prepend once');
+  const [target, message] = agent.prepended[0];
+  assert.equal(target, 'next-step');
+  assert.equal(typeof message, 'object', 'fallback must prepend a message object');
+  assert.equal(message.role, 'user');
+  assert.equal(message.source.kind, 'plugin:ai-look-up');
+  console.log('PASS  inbox.prepend fallback receives a message object');
 }
 
 console.log('ALL DSH SMOKE TESTS PASSED');
