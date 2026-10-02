@@ -1,0 +1,19 @@
+{
+  "name": "ai-look-up-market",
+  "plugins": [
+    {
+      "name": "ai-look-up",
+      "source": "./ai-look-up",
+      "version": "0.2.0",
+      "description": "Detects aimless AI grinding (repeated commands, failure loops, long runs with no output) and injects mid-run self-review nudges via hooks.",
+      "displayName": "AI Look-Up",
+      "displayName_i18n": {
+        "zh-CN": "AI 抬头"
+      },
+      "description_i18n": {
+        "zh-CN": "检测 AI 长时间空跑(重复命令、连续失败、只跑不产出),在运行中途注入自我审查提醒,让 AI 及时抬头复盘。含 /lookup-review、/lookup-status、/lookup-config 三个命令。"
+      },
+      "category": "productivity"
+    }
+  ]
+}

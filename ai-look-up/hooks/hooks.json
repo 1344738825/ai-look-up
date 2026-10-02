@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/lookup_hook.py\" prompt",
+            "timeout": 15,
+            "statusMessage": "AI 抬头:开始新的工作回合"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/lookup_hook.py\" post-use",
+            "timeout": 15,
+            "statusMessage": "AI 抬头:监控行为节奏"
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/lookup_hook.py\" post-fail",
+            "timeout": 15,
+            "statusMessage": "AI 抬头:检查失败循环"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/lookup_hook.py\" stop",
+            "timeout": 15,
+            "statusMessage": "AI 抬头:结束前审查"
+          }
+        ]
+      }
+    ]
+  }
+}

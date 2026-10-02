@@ -1,0 +1,78 @@
+# AI 抬头 (ai-look-up)
+
+让 AI 在长时间空跑时**中途自我审查**的 ZCode 插件。
+
+AI 长任务里最常见的浪费不是做错,而是**空跑**:换名字重跑同一个探针脚本(`_peek2.py`、`_peek3.py`、`_peek4.py`…)、盲目重试失败的命令、一两个小时只跑不改却毫无产出。本插件通过会话钩子持续观察 AI 的行为节奏,一旦命中空跑特征,就向对话注入一段「抬头」提醒,要求 AI 停下来对照目标、检查近几步是否带来新信息、决定继续 / 换方法 / 汇报。
+
+## 工作原理
+
+插件注册 4 个会话钩子(不拦截、不阻断任何工具调用,纯观察):
+
+| 钩子 | 作用 |
+|---|---|
+| `UserPromptSubmit` | 用户新指令到达时,开启新的工作回合(重置节奏计数) |
+| `PostToolUse` | 记录每次工具调用,评估空跑特征,命中则注入提醒 |
+| `PostToolUseFailure` | 累计连续失败,识别盲目重试循环 |
+| `Stop` | 会话结束时若长期零产出,请求一次继续以强制复盘(自限 2 次) |
+
+**空跑特征(按证据强度排序,任一命中即提醒,带冷却防刷屏):**
+
+1. **完全相同命令原样重复** —— 最近 5 条 Bash 命令中有 3 条原样相同(参数级比对):同样的输入必然得到同样的结果;
+2. **换汤不换药的相似命令** —— 最近 5 条命令归一化后有 3 条相同。归一化会抹掉文件名里的序号,所以 `python _peek2.py` 和 `python _peek3.py` 会被视为同一种试探;
+3. **超长零产出** —— 会话持续超过 25 分钟、调用频繁,却从未修改过任何文件;
+4. **调用密集零产出** —— 自上次提醒以来 30 次调用期间没有文件修改;
+5. **失败循环** —— 工具连续失败 3 次,提醒停止盲目重试。
+
+**升级阶梯**:同一会话累计 3 次提醒后仍未改善,后续提醒会加重语气,明确建议 AI 放弃当前方法、直接向用户汇报卡点——而不是继续轻声提示。
+
+**本地时钟锚点**:AI 对时间流逝的感觉不可靠,自己预估的耗时几乎总会超时。空闲运行期间,钩子每隔 10 分钟(可配)向对话注入一次真实本地时间和本段已耗时长,要求 AI 凡是涉及耗时预估、汇报一律以真实时钟为准;所有空跑提醒的文案里也都会带上当前时间和开始时间作为锚点。
+
+提醒通过 `additionalContext` 注入,内容为结构化的自我审查清单:对照最初目标 → 检查最近 5 次调用是否带来新信息 → 用一句话决定继续 / 换方法 / 汇报。
+
+## 斜杠命令
+
+- `/lookup-review` —— 手动触发一次完整的「抬头」自我审查(不依赖任何脚本路径)。
+- `/lookup-status` —— 查看插件对当前会话的监控统计与判定。
+- `/lookup-config` —— 查看 / 修改阈值配置。
+
+## 配置
+
+按优先级:内置默认 ← `~/.zcode/ai-look-up.json` ← `<项目>/.zcode/ai-look-up.json` ← 环境变量 `LOOKUP_<参数名大写>`。
+
+```jsonc
+// <项目>/.zcode/ai-look-up.json 示例:更激进地提醒
+{
+  "call_nudge_interval": 15,
+  "cooldown_sec": 120,
+  "long_run_minutes": 10,
+  "stop_check": true
+}
+```
+
+全部参数见 `/lookup-config`。
+
+## 状态与调试
+
+状态文件位于 `%TEMP%/zcode-ai-look-up/<session_id>.json`(每会话一个)。手动检查:
+
+```bash
+python <插件目录>/hooks/lookup_hook.py status
+python <插件目录>/hooks/lookup_hook.py reset
+```
+
+## 要求与排错
+
+- 需要系统可用 `python` 命令(3.8+)。若你的环境里 Python 需要完整路径,编辑 `hooks/hooks.json`,把 `python` 换成绝对路径即可。
+- 钩子失败不影响会话(只记录在 ZCode 日志);若提醒未出现,先在 **设置 → 插件** 确认插件已启用、钩子显示为可运行,再用上面的命令手动跑一次脚本验证。
+- 若插件详情中显示钩子输出校验失败,说明当前版本的输出信封格式有差异,把 `lookup_hook.py` 中 `post_use_output` / `stop_output` 的返回结构按日志提示调整即可。
+
+## Acknowledgments
+
+本项目为原创实现,思路受以下社区项目的启发,在此致谢:
+
+- [disler/claude-code-hooks-mastery](https://github.com/disler/claude-code-hooks-mastery) —— 钩子生命周期与 Stop 钩子强制复盘模式;
+- [Princeu3/agent-loop-detector](https://github.com/Princeu3/agent-loop-detector) —— 工具调用哈希比对检测循环(本项目的"原样重复"触发器借鉴了参数级比对的思路);
+- [How I Built a Watchdog That Stops My AI Coding Agent From Looping Forever](https://dev.to/yureki_lab/how-i-built-a-watchdog-that-stops-my-ai-coding-agent-from-looping-forever-61h) —— 检测 + 逐级升级的策略。
+
+与这些方案不同,本项目在运行中途(PostToolUse)分析行为节奏并以 `additionalContext` 轻量注入提醒,不打断、不重启;并新增了基于文件名序号归一化的"换汤不换药"变体检测。
+
