@@ -558,24 +558,28 @@ def brief_of(data, tool):
 
 
 def build_review_material(state, cfg, now, kind, detail):
-    log = state.get("recent_log", [])[-cfg["review_log_size"]:]
-    # 折叠连续同形条目,防"八条同形 Read"占满窗口、饿死关键证据
-    log_lines = []
-    i = 0
-    while i < len(log):
-        j = i
-        while j + 1 < len(log) and log[j + 1].get("tool") == log[i].get("tool"):
-            j += 1
-        if j > i:
-            log_lines.append("{t}×{n}({a} … {b})".format(
-                t=log[i].get("tool", "?"), n=j - i + 1,
-                a=(log[i].get("brief") or "无")[:40], b=(log[j].get("brief") or "")[:40]))
+    log = state.get("recent_log", [])
+    # 先按"连续同工具段"折叠、再取最近 N 段:关键旧证据不因新同形刷屏被挤出窗口
+    runs = []
+    for e in log:
+        if runs and runs[-1][0].get("tool") == e.get("tool"):
+            runs[-1].append(e)
         else:
-            e = log[i]
+            runs.append([e])
+    runs = runs[-cfg["review_log_size"]:]
+    log_lines = []
+    for run in runs:
+        t = run[0].get("tool", "?")
+        fails = sum(1 for e in run if not e.get("ok"))
+        head = (run[0].get("brief") or "无")[:40]
+        tail = (run[-1].get("brief") or "")[:40]
+        if len(run) > 1:
+            mark = "✗{}/{}, ".format(fails, len(run)) if fails else ""
+            log_lines.append("{t}×{n}({mark}{a} … {b})".format(
+                t=t, n=len(run), mark=mark, a=head, b=tail))
+        else:
             log_lines.append("[{t}{ok}] {b}".format(
-                t=e.get("tool", "?"), ok="" if e.get("ok") else " ✗",
-                b=(e.get("brief") or "无")[:60]))
-        i = j + 1
+                t=t, ok=" ✗" if fails else "", b=(run[0].get("brief") or "无")[:60]))
     dist = ", ".join("{k}×{v}".format(k=k, v=v) for k, v in
                      sorted(state.get("by_tool", {}).items(), key=lambda kv: -kv[1])[:4])
     parts = [
@@ -709,7 +713,8 @@ def handle_post_use(cfg, data, state, now):
             state["recent_cmds"] = recent[-8:]
     log = state.get("recent_log", [])
     log.append({"tool": tool, "brief": brief_of(data, tool), "ok": True})
-    state["recent_log"] = log[-cfg["review_log_size"]:]
+    # 原始条目保留窗口放宽(材料构造时才按段折叠压缩),否则关键旧证据进不了材料
+    state["recent_log"] = log[-max(40, cfg["review_log_size"]):]
 
     # ── 提醒有效性结算(自适应) ──
     evaluate_pending(state, cfg)

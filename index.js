@@ -354,21 +354,25 @@ const clockText = (state, now) => '🕐 【AI 抬头 · 本地时钟】' + local
   + ')。耗时预估/汇报以此为准,勿自估。';
 
 function buildReviewMaterial(state, cfg, now, kind, detail) {
-  const log = state.recentLog.slice(-cfg.reviewLogSize);
-  // 折叠连续同形条目,防"八条同形 Read"占满窗口、饿死关键证据
-  const logLines = [];
-  let i = 0;
-  while (i < log.length) {
-    let j = i;
-    while (j + 1 < log.length && log[j + 1].tool === log[i].tool) j += 1;
-    if (j > i) {
-      logLines.push(log[i].tool + '×' + (j - i + 1) + '(' + (log[i].brief || '无').slice(0, 40)
-        + ' … ' + (log[j].brief || '').slice(0, 40) + ')');
-    } else {
-      logLines.push('[' + log[i].tool + (log[i].ok ? '' : ' ✗') + '] ' + (log[i].brief || '无').slice(0, 60));
-    }
-    i = j + 1;
+  const log = state.recentLog;
+  // 先按"连续同工具段"折叠、再取最近 N 段:关键旧证据不因新同形刷屏被挤出窗口
+  const runs = [];
+  for (const e of log) {
+    if (runs.length && runs[runs.length - 1][0].tool === e.tool) runs[runs.length - 1].push(e);
+    else runs.push([e]);
   }
+  const kept = runs.slice(-cfg.reviewLogSize);
+  const logLines = kept.map((run) => {
+    const t = run[0].tool ?? '?';
+    const fails = run.filter((e) => !e.ok).length;
+    const head = (run[0].brief || '无').slice(0, 40);
+    const tail = (run[run.length - 1].brief || '').slice(0, 40);
+    if (run.length > 1) {
+      const mark = fails ? '✗' + fails + '/' + run.length + ', ' : '';
+      return t + '×' + run.length + '(' + mark + head + ' … ' + tail + ')';
+    }
+    return '[' + t + (fails ? ' ✗' : '') + '] ' + head;
+  });
   const dist = [...Object.entries(state.byTool)].sort((a, b) => b[1] - a[1]).slice(0, 4)
     .map(([k, v]) => k + '×' + v).join(', ');
   return [
@@ -522,11 +526,16 @@ export function apply(ctx, config) {
       reviewer.review(agent, material, signal, system).then((raw) => {
         st.reviewInFlight = false;
         const verdict = parseVerdict(raw);
-        if (verdict && verdict.verdict === 'on-track' && !FUZZY_KINDS.has(kind)) {
-          deliver(agent, ctx, fallbackText);
+        if (!verdict) { deliver(agent, ctx, fallbackText); return; }
+        if (verdict.verdict === 'on-track') {
+          // 机械证据型忽略 on-track(触发条件本身即"非正轨"证据),模糊型用短确认
+          deliver(agent, ctx, FUZZY_KINDS.has(kind) ? verdictText(verdict) : fallbackText);
           return;
         }
-        deliver(agent, ctx, verdict ? verdictText(verdict) : fallbackText);
+        // 非 on-track:机械证据型保留完整静态清单并附判定(与 ZCode 对齐);模糊型整体替换
+        deliver(agent, ctx, FUZZY_KINDS.has(kind)
+          ? verdictText(verdict)
+          : fallbackText + '\n' + verdictText(verdict));
       }).catch((error) => {
         st.reviewInFlight = false;
         ctx?.logger?.warn?.('[ai-look-up] reviewer fell back to static checklist: %o', error);
@@ -647,7 +656,7 @@ export function apply(ctx, config) {
         st.failStreak += 1;
         st.totalFailures += 1;
         st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: false });
-        st.recentLog = st.recentLog.slice(-cfg.reviewLogSize);
+        st.recentLog = st.recentLog.slice(-Math.max(40, cfg.reviewLogSize));
         if (st.failStreak >= cfg.failStreakThreshold
             && now - st.lastFailReminderAt >= kindCooldown('fail-loop', cfg.failCooldownSec * 1000)
             && st.reminders < cfg.maxReminders && cfg.enabled) {
@@ -679,7 +688,8 @@ export function apply(ctx, config) {
       } else {
         st.failStreak = 0;
         st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: true });
-        st.recentLog = st.recentLog.slice(-cfg.reviewLogSize);
+        // raw window is generous; run-compression happens at material build time
+        st.recentLog = st.recentLog.slice(-Math.max(40, cfg.reviewLogSize));
       }
 
       if (!cfg.enabled) return;
