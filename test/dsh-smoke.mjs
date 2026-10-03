@@ -275,4 +275,47 @@ const texts = (agent) =>
   console.log('PASS  lesson ledger registers pitfalls and briefs new agents');
 }
 
+// 15) on-track gating: mechanical kinds keep the full checklist, fuzzy kinds get the short confirm
+{
+  const fakeLlm = {
+    async *stream() {
+      yield { type: 'text', text: '{"verdict":"on-track","reason":"未发现异常","suggestion":"继续"}' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+  const mech = makeHarness({ lessons: false }, { llm: fakeLlm });
+  const mechAgent = mech.makeAgent();
+  mechAgent.session.requestHeader = () => ({ config: { provider: 'd', model: 'm' } });
+  mech.emit('agent/created', mechAgent);
+  for (let i = 0; i < 3; i++) mech.emit('tools/result', exec(mechAgent, 'Bash', { command: 'python x.py' }), { isError: true });
+  await new Promise((r) => setTimeout(r, 20));
+  const mechOut = texts(mechAgent);
+  assert(mechOut.some((t) => t.includes('失败循环') && t.includes('根因')), 'mechanical kind keeps full checklist');
+  assert(!mechOut.some((t) => t.includes('仍在正轨')), 'mechanical kind must not be waved through');
+
+  const fuzzy = makeHarness({ lessons: false, callNudgeInterval: 5 }, { llm: fakeLlm });
+  const fuzzyAgent = fuzzy.makeAgent();
+  fuzzyAgent.session.requestHeader = () => ({ config: { provider: 'd', model: 'm' } });
+  fuzzy.emit('agent/created', fuzzyAgent);
+  for (let i = 0; i < 5; i++) fuzzy.emit('tools/result', exec(fuzzyAgent, 'Read', { file_path: 'a' }), { isError: false });
+  await new Promise((r) => setTimeout(r, 20));
+  const fuzzyOut = texts(fuzzyAgent);
+  assert(fuzzyOut.some((t) => t.includes('仍在正轨') && t.includes('保持节奏')), 'fuzzy kind gets the short confirm');
+  assert(!fuzzyOut.some((t) => t.includes('① 对照')), 'short confirm replaces the checklist');
+  console.log('PASS  on-track short confirm only applies to fuzzy triggers');
+}
+
+// 16) lessons force re-injection every 5 prompts (mid-session registration reaches the live agent)
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  for (let i = 0; i < 3; i++) emit('tools/result', exec(agent, 'Bash', { command: 'python bad_thing.py' }), { isError: true });
+  const briefsBefore = texts(agent).filter((t) => t.includes('已知坑位')).length;
+  for (let n = 1; n <= 5; n++) emit('session/event', agent.session, { type: 'user/message' });
+  const briefsAfter = texts(agent).filter((t) => t.includes('已知坑位')).length;
+  assert(briefsAfter > briefsBefore, 'the 5th prompt must force a lessons re-injection');
+  console.log('PASS  lessons force re-injection on the 5th prompt');
+}
+
 console.log('ALL DSH SMOKE TESTS PASSED');

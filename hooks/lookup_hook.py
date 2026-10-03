@@ -102,6 +102,19 @@ REVIEW_SYSTEM = (
 
 VERDICT_LABEL = {"on-track": "仍在正轨", "drifting": "有偏航迹象", "stuck": "空跑确认"}
 
+# 模糊型触发:统计信号可能误报,on-track 短确认有意义。
+# 机械证据型(重复/折返/失败循环/结束前审查)的触发条件本身就是"非正轨"的证据,
+# 审查者回 on-track 时忽略判定、保留完整静态清单,避免自相矛盾。
+FUZZY_KINDS = {"no-output", "long-run"}
+
+
+def clip_goal(goal, head=120, tail=80):
+    """目标截断保两端:约束/禁区通常写在任务描述的尾部。"""
+    goal = goal or ""
+    if len(goal) <= head + tail:
+        return goal
+    return goal[:head] + " … " + goal[-tail:]
+
 DRIFT_LABEL = {"on-track": "仍在服务主线", "drifting": "子任务喧宾夺主", "stuck": "已明显偏离主线"}
 
 REVIEW_DRIFT_SYSTEM = (
@@ -506,7 +519,7 @@ def local_hm(ts):
 def nudge_text(state, cfg, now, specific):
     mins = fmt_minutes(state, now)
     lines = [
-        "🔔 【AI 抬头 · 中途自我审查】时钟 {h},本段 {m:.0f} 分钟/{c} 次调用,修改 {e} 次。自查:".format(
+        "🔔 【AI 抬头 · 中途自我审查】时钟 {h},本段 {m:.0f} 分钟/{c} 次调用,修改 {e} 次。停一下,自查:".format(
             h=local_hm(now), m=mins,
             c=state["calls_since_reminder"], e=state["edits_since_reminder"]),
         "① 对照最初目标是否偏移?② 最近 5 次调用有无新信息?若无 → 正在空跑。",
@@ -528,21 +541,51 @@ def clock_text(state, now):
     ).format(h=local_hm(now), hs=local_hm(state.get("started_at", now)), m=fmt_minutes(state, now))
 
 
+def brief_of(data, tool):
+    """结构化参数摘要:Bash 取命令,文件类工具取路径,其余取参数 JSON 前段。"""
+    if tool == "Bash":
+        return extract_cmd(data)[:100]
+    ti = data.get("tool_input") or data.get("toolInput") or {}
+    if isinstance(ti, dict):
+        for k in ("file_path", "path", "notebook_path", "url", "query"):
+            if ti.get(k):
+                return str(ti[k])[:100]
+        try:
+            return json.dumps(ti, ensure_ascii=False)[:80]
+        except Exception:
+            return ""
+    return ""
+
+
 def build_review_material(state, cfg, now, kind, detail):
-    log_lines = [
-        "{i}. [{t}{ok}] {b}".format(
-            i=i + 1, t=e.get("tool", "?"),
-            ok="" if e.get("ok") else " ✗",
-            b=(e.get("brief") or "无")[:60])
-        for i, e in enumerate(state.get("recent_log", [])[-min(8, cfg["review_log_size"]):])
-    ]
+    log = state.get("recent_log", [])[-cfg["review_log_size"]:]
+    # 折叠连续同形条目,防"八条同形 Read"占满窗口、饿死关键证据
+    log_lines = []
+    i = 0
+    while i < len(log):
+        j = i
+        while j + 1 < len(log) and log[j + 1].get("tool") == log[i].get("tool"):
+            j += 1
+        if j > i:
+            log_lines.append("{t}×{n}({a} … {b})".format(
+                t=log[i].get("tool", "?"), n=j - i + 1,
+                a=(log[i].get("brief") or "无")[:40], b=(log[j].get("brief") or "")[:40]))
+        else:
+            e = log[i]
+            log_lines.append("[{t}{ok}] {b}".format(
+                t=e.get("tool", "?"), ok="" if e.get("ok") else " ✗",
+                b=(e.get("brief") or "无")[:60]))
+        i = j + 1
+    dist = ", ".join("{k}×{v}".format(k=k, v=v) for k, v in
+                     sorted(state.get("by_tool", {}).items(), key=lambda kv: -kv[1])[:4])
     parts = [
         "【审查材料】触发: " + kind,
-        "【任务】" + (state.get("last_goal") or "(未捕获)")[:200],
+        "【任务】" + clip_goal(state.get("last_goal")),
         "【统计】{m:.0f} 分钟/{c} 次调用/修改 {e},连败 {f},累计败 {t}。".format(
             m=fmt_minutes(state, now), c=state.get("tool_calls", 0),
             e=state.get("edits", 0), f=state.get("fail_streak", 0),
             t=state.get("total_failures", 0)),
+        "【分布】" + (dist or "无"),
         "【最近调用(旧→新)】",
     ]
     parts.extend(log_lines)
@@ -598,7 +641,8 @@ def call_llm_review(state, cfg, now, kind, detail, system=REVIEW_SYSTEM):
 
 def finalize_text(state, cfg, now, kind, detail, static_text):
     """提醒发出前的最后一站:llm_review 开启时追加独立审查结论,失败回退静态文案。
-    on-track 判定用短确认替代完整清单,省上下文。"""
+    on-track 仅对模糊型触发(no-output/long-run)用短确认;机械证据型忽略判定,
+    保留完整静态清单——连续失败/零产出是既成事实,不能被"仍在正轨"放行。"""
     if not cfg.get("llm_review"):
         return static_text
     verdict = call_llm_review(state, cfg, now, kind, detail)
@@ -606,6 +650,8 @@ def finalize_text(state, cfg, now, kind, detail, static_text):
         return static_text
     state["reviews"] = state.get("reviews", 0) + 1
     if verdict["verdict"] == "on-track":
+        if kind not in FUZZY_KINDS:
+            return static_text
         return (static_text.split("\n")[0]
                 + "\n🔎 【AI 抬头 · 独立审查】仍在正轨(" + (verdict["reason"] or "无异常")
                 + ")——保持节奏。")
@@ -662,7 +708,7 @@ def handle_post_use(cfg, data, state, now):
             recent.append({"t": now, "n": n, "r": r})
             state["recent_cmds"] = recent[-8:]
     log = state.get("recent_log", [])
-    log.append({"tool": tool, "brief": (extract_cmd(data) or "")[:100], "ok": True})
+    log.append({"tool": tool, "brief": brief_of(data, tool), "ok": True})
     state["recent_log"] = log[-cfg["review_log_size"]:]
 
     # ── 提醒有效性结算(自适应) ──
@@ -802,7 +848,7 @@ def handle_post_fail(cfg, data, state, now):
     state["total_failures"] += 1
     log = state.get("recent_log", [])
     log.append({"tool": str(data.get("tool_name") or data.get("toolName") or "Unknown"),
-                "brief": (extract_cmd(data) or "")[:100], "ok": False})
+                "brief": brief_of(data, str(data.get("tool_name") or data.get("toolName") or "Unknown")), "ok": False})
     state["recent_log"] = log[-cfg["review_log_size"]:]
     if state["fail_streak"] < cfg["fail_streak_threshold"]:
         return None

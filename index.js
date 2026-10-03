@@ -102,11 +102,11 @@ function registerLesson(pattern, correction) {
   }
 }
 
-function lessonsMessage(state) {
+function lessonsMessage(state, force = false) {
   if (!lessonsLedger.size) return null;
   const top = [...lessonsLedger.values()].sort((a, b) => b.hits - a.hits).slice(0, 3);
   const sig = top.map((e) => e.pattern + 'x' + e.hits).join('|');
-  if (state.lessonsSig === sig) return null;
+  if (state.lessonsSig === sig && !force) return null;
   state.lessonsSig = sig;
   const lines = ['📚 【AI 抬头 · 已知坑位】请勿重复:'];
   top.forEach((e, i) => lines.push((i + 1) + '. [' + e.hits + ' 次] ' + e.pattern + ' —— ' + e.correction));
@@ -127,6 +127,17 @@ const VERDICT_LABEL = {
   'on-track': '仍在正轨',
   'drifting': '有偏航迹象',
   'stuck': '空跑确认',
+};
+
+// 模糊型触发:统计信号可能误报,on-track 短确认有意义。
+// 机械证据型(重复/折返/失败循环/结束前审查)的触发条件本身就是"非正轨"的证据,
+// 审查者回 on-track 时忽略判定、保留完整静态清单,避免自相矛盾。
+const FUZZY_KINDS = new Set(['no-output', 'long-run']);
+
+const clipGoal = (goal, head = 120, tail = 80) => {
+  goal = goal || '';
+  if (goal.length <= head + tail) return goal;
+  return goal.slice(0, head) + ' … ' + goal.slice(-tail);
 };
 
 const localHm = (ts) => new Date(ts).toTimeString().slice(0, 5);
@@ -178,12 +189,17 @@ function toolNameOf(exec) {
   return 'Unknown';
 }
 
-function briefOf(exec, cmd) {
-  if (cmd) return cmd.slice(0, 100);
+function briefOf(exec, cmd, tool) {
+  if (tool === 'Bash' && cmd) return cmd.slice(0, 100);
   const input = exec?.input ?? exec?.arguments ?? exec?.args ?? exec?.toolInput;
-  if (input === undefined || input === null) return '';
+  if (input && typeof input === 'object') {
+    for (const key of ['file_path', 'path', 'notebook_path', 'url', 'query']) {
+      if (input[key]) return String(input[key]).slice(0, 100);
+    }
+  }
+  if (cmd) return cmd.slice(0, 100);
   try {
-    return JSON.stringify(input).slice(0, 100);
+    return JSON.stringify(input ?? {}).slice(0, 80);
   } catch {
     return '';
   }
@@ -322,7 +338,7 @@ function nudgeText(state, cfg, now, specific) {
   const lines = [
     '🔔 【AI 抬头 · 中途自我审查】时钟 ' + localHm(now)
       + ',本段 ' + minutesSince(state, now).toFixed(0) + ' 分钟/'
-      + state.callsSinceReminder + ' 次调用,修改 ' + state.editsSinceReminder + ' 次。自查:',
+      + state.callsSinceReminder + ' 次调用,修改 ' + state.editsSinceReminder + ' 次。停一下,自查:',
     '① 对照最初目标是否偏移?② 最近 5 次调用有无新信息?若无 → 正在空跑。',
   ];
   if (specific) lines.push('③ ' + specific);
@@ -338,14 +354,30 @@ const clockText = (state, now) => '🕐 【AI 抬头 · 本地时钟】' + local
   + ')。耗时预估/汇报以此为准,勿自估。';
 
 function buildReviewMaterial(state, cfg, now, kind, detail) {
-  const logLines = state.recentLog.slice(-Math.min(8, cfg.reviewLogSize)).map((entry, i) =>
-    (i + 1) + '. [' + entry.tool + (entry.ok ? '' : ' ✗') + '] ' + (entry.brief || '无').slice(0, 60));
+  const log = state.recentLog.slice(-cfg.reviewLogSize);
+  // 折叠连续同形条目,防"八条同形 Read"占满窗口、饿死关键证据
+  const logLines = [];
+  let i = 0;
+  while (i < log.length) {
+    let j = i;
+    while (j + 1 < log.length && log[j + 1].tool === log[i].tool) j += 1;
+    if (j > i) {
+      logLines.push(log[i].tool + '×' + (j - i + 1) + '(' + (log[i].brief || '无').slice(0, 40)
+        + ' … ' + (log[j].brief || '').slice(0, 40) + ')');
+    } else {
+      logLines.push('[' + log[i].tool + (log[i].ok ? '' : ' ✗') + '] ' + (log[i].brief || '无').slice(0, 60));
+    }
+    i = j + 1;
+  }
+  const dist = [...Object.entries(state.byTool)].sort((a, b) => b[1] - a[1]).slice(0, 4)
+    .map(([k, v]) => k + '×' + v).join(', ');
   return [
     '【审查材料】触发: ' + kind,
-    '【任务】' + (state.goal || '(未捕获)').slice(0, 200),
+    '【任务】' + clipGoal(state.goal),
     '【统计】' + minutesSince(state, now).toFixed(0) + ' 分钟/' + state.toolCalls
       + ' 次调用/修改 ' + state.edits + ',连败 ' + state.failStreak + ',累计败 '
       + state.totalFailures + '。',
+    '【分布】' + (dist || '无'),
     '【最近调用(旧→新)】',
     ...logLines,
     detail ? '【细节】' + detail : '',
@@ -490,6 +522,10 @@ export function apply(ctx, config) {
       reviewer.review(agent, material, signal, system).then((raw) => {
         st.reviewInFlight = false;
         const verdict = parseVerdict(raw);
+        if (verdict && verdict.verdict === 'on-track' && !FUZZY_KINDS.has(kind)) {
+          deliver(agent, ctx, fallbackText);
+          return;
+        }
         deliver(agent, ctx, verdict ? verdictText(verdict) : fallbackText);
       }).catch((error) => {
         st.reviewInFlight = false;
@@ -538,6 +574,11 @@ export function apply(ctx, config) {
             st.goal = event.data.text.slice(0, 400);
           }
         } catch { /* goal capture is best-effort */ }
+        // 会话中途注册的坑位也要有投递点:每 5 个回合强制重注一次
+        if (cfg.lessons) {
+          const known = lessonsMessage(st, st.promptResets % 5 === 0);
+          if (known) deliver(agent, ctx, known);
+        }
         return;
       }
       // turn/end: wrap-up review for long, outputless sessions
@@ -605,7 +646,7 @@ export function apply(ctx, config) {
       if (isError) {
         st.failStreak += 1;
         st.totalFailures += 1;
-        st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec)), ok: false });
+        st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: false });
         st.recentLog = st.recentLog.slice(-cfg.reviewLogSize);
         if (st.failStreak >= cfg.failStreakThreshold
             && now - st.lastFailReminderAt >= kindCooldown('fail-loop', cfg.failCooldownSec * 1000)
@@ -637,7 +678,7 @@ export function apply(ctx, config) {
         }
       } else {
         st.failStreak = 0;
-        st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec)), ok: true });
+        st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: true });
         st.recentLog = st.recentLog.slice(-cfg.reviewLogSize);
       }
 
