@@ -3,6 +3,9 @@
  * Run with any Node >= 18:  node test/dsh-smoke.mjs
  */
 import assert from 'node:assert/strict';
+import { writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { apply } from '../index.js';
 
 function makeHarness(config, services = {}) {
@@ -83,7 +86,7 @@ const texts = (agent) =>
 
 // 5) enabled:false is fully silent
 {
-  const { emit, makeAgent } = makeHarness({ enabled: false });
+  const { emit, makeAgent } = makeHarness({ enabled: false, lessons: false });
   const agent = makeAgent();
   emit('agent/created', agent);
   for (let i = 0; i < 40; i++) emit('tools/result', exec(agent, 'Bash', { command: 'python x.py' }), { isError: true });
@@ -93,7 +96,7 @@ const texts = (agent) =>
 
 // 6) user/message resets the turn counters (no nudge right after reset)
 {
-  const { emit, makeAgent } = makeHarness({});
+  const { emit, makeAgent } = makeHarness({ lessons: false });
   const agent = makeAgent();
   agent.session = {};
   emit('agent/created', agent);
@@ -106,13 +109,13 @@ const texts = (agent) =>
 
 // 7) every injected nudge is a full dsh UserMessage, never a bare string
 {
-  const failingHarness = makeHarness({ clockTick: false });
+  const failingHarness = makeHarness({ clockTick: false, lessons: false });
   const failing = failingHarness.makeAgent();
   failingHarness.emit('agent/created', failing);
   for (let i = 0; i < 3; i++) {
     failingHarness.emit('tools/result', exec(failing, 'Bash', { command: 'python x.py' }), { isError: true });
   }
-  const tickingHarness = makeHarness({ clockTickMinutes: 0 });
+  const tickingHarness = makeHarness({ clockTickMinutes: 0, lessons: false });
   const ticking = tickingHarness.makeAgent();
   tickingHarness.emit('agent/created', ticking);
   tickingHarness.emit('tools/result', exec(ticking, 'Read', { file_path: 'a.txt' }), { isError: false });
@@ -136,7 +139,7 @@ const texts = (agent) =>
 
 // 8) inbox fallback path also receives a message object
 {
-  const { emit, makeAgent } = makeHarness({ clockTickMinutes: 0 });
+  const { emit, makeAgent } = makeHarness({ clockTickMinutes: 0, lessons: false });
   const agent = makeAgent();
   delete agent.inject;
   agent.prepended = [];
@@ -203,7 +206,7 @@ const texts = (agent) =>
 
 // 11) without the llm service the static checklist is used immediately
 {
-  const { emit, makeAgent } = makeHarness({});
+  const { emit, makeAgent } = makeHarness({ lessons: false });
   const agent = makeAgent();
   emit('agent/created', agent);
   for (let i = 0; i < 6; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
@@ -212,6 +215,64 @@ const texts = (agent) =>
   assert(texts(agent).some((t) => t.includes('中途自我审查')), 'static checklist injected');
   assert(!texts(agent).some((t) => t.includes('独立审查')), 'no reviewer verdict without llm');
   console.log('PASS  no llm service means static checklist, no async detour');
+}
+
+// 12) fold-back: file content returning to a seen state fires the nudge
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  const path = join(tmpdir(), 'lookup-fb-' + Date.now() + '.txt');
+  await writeFile(path, 'AAA');
+  emit('tools/result', exec(agent, 'Write', { file_path: path }), { isError: false });
+  await writeFile(path, 'BBB');
+  emit('tools/result', exec(agent, 'Write', { file_path: path }), { isError: false });
+  await writeFile(path, 'AAA');
+  emit('tools/result', exec(agent, 'Write', { file_path: path }), { isError: false });
+  await new Promise((r) => setTimeout(r, 30));
+  assert(texts(agent).some((t) => t.includes('原地打转')), 'ping-pong edits must trigger fold-back');
+  console.log('PASS  fold-back edit detection fires on ping-pong edits');
+}
+
+// 13) goal-drift patrol injects only on drifting/stuck verdicts
+{
+  const driftCalls = [];
+  const fakeLlm = {
+    async *stream(options) {
+      driftCalls.push(options);
+      yield { type: 'text', text: '{"verdict":"drifting","reason":"查禁卡表已从核验手段变成独立目标","suggestion":"收束回卡包分解建议"}' };
+      yield { type: 'finish', reason: { kind: 'stop' } };
+    },
+  };
+  const { emit, makeAgent } = makeHarness({ driftCheckCalls: 2, driftCooldownSec: 3600 }, { llm: fakeLlm });
+  const agent = makeAgent();
+  agent.session.requestHeader = () => ({ config: { provider: 'd', model: 'm' } });
+  emit('agent/created', agent);
+  emit('session/event', agent.session, { type: 'user/message', data: { content: [{ type: 'text', text: '核验卡包分解建议' }] } });
+  for (let i = 0; i < 3; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a' }), { isError: false });
+  await new Promise((r) => setTimeout(r, 20));
+  const out = texts(agent);
+  assert(out.some((t) => t.includes('目标漂移') && t.includes('喧宾夺主')), 'drift verdict must inject');
+  assert.equal(driftCalls.length, 1, 'cooldown must hold within the patrol window');
+  assert(driftCalls[0].system.includes('目标漂移审查员'), 'patrol uses the drift-specific system prompt');
+  assert(driftCalls[0].messages[0].content[0].text.includes('核验卡包分解建议'), 'patrol material includes the original goal');
+  console.log('PASS  goal-drift patrol injects on drifting verdict, silent on cooldown');
+}
+
+// 14) lesson ledger: failure loops register pitfalls, new agents get the top ones
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  for (let i = 0; i < 3; i++) {
+    emit('tools/result', exec(agent, 'Bash', { command: 'python bad_thing.py --flag' }), { isError: true });
+  }
+  assert(texts(agent).some((t) => t.includes('失败循环')), 'fail-loop must fire first');
+  const rookie = makeAgent();
+  emit('agent/created', rookie);
+  assert(texts(rookie).some((t) => t.includes('已知坑位') && t.includes('bad_thing')),
+    'a freshly created agent must receive the registered lesson');
+  console.log('PASS  lesson ledger registers pitfalls and briefs new agents');
 }
 
 console.log('ALL DSH SMOKE TESTS PASSED');

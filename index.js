@@ -20,7 +20,8 @@
  * - `llm` (optional)    independent reviewer calls
  */
 
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
+import { readFile } from 'node:fs/promises';
 
 const PRODUCTIVE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'ApplyPatch']);
 
@@ -39,13 +40,75 @@ const DEFAULTS = {
   stopCheck: true,
   stopMinCalls: 40,
   clockTick: true,
-  clockTickMinutes: 10,
+  clockTickMinutes: 5,
+  clockTickBackoff: true,
+  clockTickMaxMinutes: 60,
   maxRecentCmds: 8,
   // independent reviewer (v0.4): one LLM call per trigger, strict JSON verdict
   llmReview: true,
   llmTimeoutMs: 20000,
   reviewLogSize: 12,
+  // fold-back edit detection (v0.5): file content returning to a seen state
+  editFoldback: true,
+  foldbackWindow: 5,
+  // adaptive reminder effectiveness (v0.5): effective reminders fire more often
+  adaptive: true,
+  // goal-drift patrol (v0.5): every N calls the reviewer checks goal alignment
+  driftCheck: true,
+  driftCheckCalls: 30,
+  driftCooldownSec: 900,
+  // lesson ledger (v0.5): failures register pitfalls, new agents get the top ones
+  lessons: true,
 };
+
+const DRIFT_LABEL = {
+  'on-track': '仍在服务主线',
+  'drifting': '子任务喧宾夺主',
+  'stuck': '已明显偏离主线',
+};
+
+const REVIEW_DRIFT_SYSTEM = [
+  '你是 AI 编码代理的目标漂移审查员。主代理看不到你的存在。长上下文任务最常见的失败是:',
+  '最初为核验某个决定而展开的子任务,做着做着变成了独立目标,喧宾夺主。',
+  '你只依据最初任务描述与最近工具调用记录判断:当前行为是否仍在服务最初目标,',
+  '还是某个子任务已经扩张成了事实上的新目标。只输出一个 JSON 对象,不要输出任何其他文字:',
+  '{"verdict":"on-track|drifting|stuck","reason":"一句话:当前行为与最初目标的关系","suggestion":"一句话:如何收束"}',
+  'on-track=仍在服务主线;drifting=子任务喧宾夺主;stuck=已明显偏离主线。',
+].join('\n');
+
+/**
+ * Reminder-effectiveness stats, keyed by trigger kind. Module scope so it
+ * survives across sessions within one host process; the ZCode side persists
+ * the same structure to disk (adaptive.json).
+ */
+const adaptiveStats = new Map();
+
+/**
+ * Lesson ledger (module scope, per host process): failure loops register the
+ * repeating command pattern; freshly created agents receive the top lessons
+ * so known pitfalls survive conversation compaction. The ZCode side persists
+ * the same structure to disk (lessons.json).
+ */
+const lessonsLedger = new Map();
+
+function registerLesson(pattern, correction) {
+  if (!pattern) return;
+  const prev = lessonsLedger.get(pattern);
+  if (prev) {
+    prev.hits += 1;
+    prev.correction = correction;
+  } else {
+    lessonsLedger.set(pattern, { pattern, correction, hits: 1 });
+  }
+}
+
+function lessonsMessage() {
+  if (!lessonsLedger.size) return null;
+  const top = [...lessonsLedger.values()].sort((a, b) => b.hits - a.hits).slice(0, 3);
+  const lines = ['📚 【AI 抬头 · 已知坑位】此前的会话在这些地方踩过坑,请勿重复:'];
+  top.forEach((e, i) => lines.push((i + 1) + '. [' + e.hits + ' 次] ' + e.pattern + ' —— ' + e.correction));
+  return lines.join('\n');
+}
 
 const STALE_AFTER_MS = 2 * 60 * 60 * 1000;
 
@@ -135,15 +198,19 @@ function freshState() {
     reminders: 0, lastReminderAt: 0, lastFailReminderAt: 0, lastTrigger: '',
     stopBlocks: 0, promptResets: 0, lastClockTickAt: 0, clockTicks: 0,
     reviewInFlight: false,
+    fileHashes: {}, pendingReminders: [],
+    driftChecks: 0, lastDriftAt: 0, callsAtLastDrift: 0,
+    clockInterval: 0,
   };
 }
 
-function resetStretch(state, now) {
+function resetStretch(state, cfg, now) {
   state.startedAt = now;
   state.callsSinceReminder = 0;
   state.editsSinceReminder = 0;
   state.failStreak = 0;
   state.recentCmds = [];
+  state.clockInterval = 0;
 }
 
 function repeatHit(state, cfg) {
@@ -173,7 +240,79 @@ function fire(state, cfg, now, kind, text, cooldownMs) {
   state.lastTrigger = kind;
   state.callsSinceReminder = 0;
   state.editsSinceReminder = 0;
+  const cur = state.recentCmds;
+  state.pendingReminders.push({
+    kind,
+    callsAt: state.toolCalls,
+    editsAt: state.edits,
+    fail: state.failStreak,
+    norm: cur.length ? cur[cur.length - 1].n : '',
+  });
+  state.pendingReminders = state.pendingReminders.slice(-10);
   return text;
+}
+
+/** Adaptive cooldown per trigger kind: ineffective reminders back off, effective ones tighten. */
+function kindCooldown(kind, base) {
+  const stats = adaptiveStats.get(kind);
+  if (!stats || stats.fired < 5) return base;
+  const rate = stats.effective / Math.max(1, stats.fired);
+  if (rate < 0.3) return Math.min(base * 2, base * 4);
+  if (rate > 0.7) return Math.max(base * 0.75, 60000);
+  return base;
+}
+
+/** Settle reminders fired ≥10 calls ago: an edit, a stopped failure streak, or a changed command pattern counts as effective. */
+function evaluatePending(state) {
+  if (!state.pendingReminders.length) return;
+  const remaining = [];
+  let changed = false;
+  for (const p of state.pendingReminders) {
+    if (state.toolCalls - p.callsAt < 10) { remaining.push(p); continue; }
+    let effective = (state.edits - p.editsAt > 0) || (state.failStreak === 0 && p.fail > 0);
+    if (!effective) {
+      const cur = state.recentCmds;
+      const last = cur.length ? cur[cur.length - 1].n : '';
+      effective = Boolean(last) && last !== p.norm;
+    }
+    const stats = adaptiveStats.get(p.kind) ?? { fired: 0, effective: 0 };
+    stats.fired += 1;
+    if (effective) stats.effective += 1;
+    adaptiveStats.set(p.kind, stats);
+    changed = true;
+  }
+  if (changed || remaining.length !== state.pendingReminders.length) {
+    state.pendingReminders = remaining;
+  }
+}
+
+/**
+ * Record the file content hash after each Edit/Write; content returning to a
+ * previously seen state (ping-pong edits) is fold-back grinding. Returns
+ * {hit, path}, or null when the file cannot be read.
+ */
+async function recordEditHash(state, cfg, exec) {
+  const input = exec?.input ?? exec?.arguments ?? exec?.args ?? exec?.toolInput;
+  if (!input || typeof input !== 'object') return null;
+  const rawPath = input.file_path ?? input.path ?? input.notebook_path;
+  if (!rawPath) return null;
+  const path = String(rawPath);
+  let hash = '';
+  try {
+    const content = await readFile(path);
+    hash = createHash('md5').update(content).digest('hex').slice(0, 12);
+  } catch {
+    return null;
+  }
+  const seen = state.fileHashes[path] ?? [];
+  const hit = seen.length >= 1 && seen.slice(0, -1).includes(hash);
+  seen.push(hash);
+  state.fileHashes[path] = seen.slice(-cfg.foldbackWindow);
+  const paths = Object.keys(state.fileHashes);
+  if (paths.length > 16) {
+    for (const k of paths.slice(0, paths.length - 16)) delete state.fileHashes[k];
+  }
+  return { hit, path };
 }
 
 function nudgeText(state, cfg, now, specific) {
@@ -298,7 +437,7 @@ function makeReviewer(ctx) {
   }
   return {
     get ready() { return llm !== null; },
-    async review(agent, material, signal) {
+    async review(agent, material, signal, system = REVIEW_SYSTEM) {
       const header = agent?.session?.requestHeader?.();
       const provider = header?.config?.provider ?? '';
       const model = header?.config?.model ?? '';
@@ -306,7 +445,7 @@ function makeReviewer(ctx) {
       if (!provider || !model) throw new Error('no request-header route on this session');
       const options = {
         provider, model,
-        system: REVIEW_SYSTEM,
+        system,
         messages: [{ role: 'user', content: [{ type: 'text', text: material }] }],
         temperature: 0,
         signal,
@@ -347,14 +486,14 @@ export function apply(ctx, config) {
    * otherwise the static checklist. Never blocks the tool-result stream; the
    * review lands via agent.inject() when it completes.
    */
-  const deliverOrReview = (agent, st, kind, detail, fallbackText) => {
+  const deliverOrReview = (agent, st, kind, detail, fallbackText, system = REVIEW_SYSTEM) => {
     const now = Date.now();
     if (cfg.llmReview && reviewer.ready && !st.reviewInFlight) {
       st.reviewInFlight = true;
       const material = buildReviewMaterial(st, cfg, now, kind, detail);
       const signal = typeof AbortSignal !== 'undefined' && AbortSignal.timeout
         ? AbortSignal.timeout(cfg.llmTimeoutMs) : undefined;
-      reviewer.review(agent, material, signal).then((raw) => {
+      reviewer.review(agent, material, signal, system).then((raw) => {
         st.reviewInFlight = false;
         const verdict = parseVerdict(raw);
         deliver(agent, ctx, verdict ? verdictText(verdict) : fallbackText);
@@ -370,6 +509,10 @@ export function apply(ctx, config) {
 
   ctx.on('agent/created', (agent) => {
     state.set(agent, freshState());
+    if (cfg.lessons) {
+      const known = lessonsMessage();
+      if (known) deliver(agent, ctx, known);
+    }
     try {
       agent.ctx?.effect?.(() => () => state.delete(agent));
     } catch (error) {
@@ -387,10 +530,10 @@ export function apply(ctx, config) {
       if (agent === null) return;
       const st = stateOf(agent);
       const now = Date.now();
-      if (now - st.lastEventAt > STALE_AFTER_MS) resetStretch(st, now);
+      if (now - st.lastEventAt > STALE_AFTER_MS) resetStretch(st, cfg, now);
       if (event.type === 'user/message') {
         st.promptResets += 1;
-        resetStretch(st, now);
+        resetStretch(st, cfg, now);
         // capture the task description for the reviewer
         try {
           const content = event?.data?.content;
@@ -410,7 +553,7 @@ export function apply(ctx, config) {
           && minutesSince(st, now) >= cfg.longRunMinutes) {
         st.stopBlocks += 1;
         const elapsed = minutesSince(st, now);
-        resetStretch(st, now);
+        resetStretch(st, cfg, now);
         const text = [
           '🔔 【AI 抬头 · 结束前审查】这轮会话累计 ' + st.toolCalls + ' 次工具调用、约 '
             + elapsed.toFixed(0) + ' 分钟,但没有任何文件被修改。在结束回复之前,请先:',
@@ -432,7 +575,7 @@ export function apply(ctx, config) {
       if (exec?.signal?.aborted) return;
       const st = stateOf(agent);
       const now = Date.now();
-      if (now - st.lastEventAt > STALE_AFTER_MS) resetStretch(st, now);
+      if (now - st.lastEventAt > STALE_AFTER_MS) resetStretch(st, cfg, now);
       st.lastEventAt = now;
 
       const tool = toolNameOf(exec);
@@ -443,6 +586,17 @@ export function apply(ctx, config) {
       if (PRODUCTIVE_TOOLS.has(tool)) {
         st.edits += 1;
         st.editsSinceReminder += 1;
+        if (cfg.editFoldback) {
+          recordEditHash(st, cfg, exec).then((hit) => {
+            if (!hit || !cfg.enabled) return;
+            const nowFb = Date.now();
+            const text = fire(st, cfg, nowFb, 'edit-foldback', nudgeText(st, cfg, nowFb,
+              '文件 ' + hit.path + ' 的内容回到了先前见过的状态——改了又改回是典型的原地打转,'
+              + '请确认这条修改路径是否还有意义。'), kindCooldown('edit-foldback', cfg.cooldownSec * 1000));
+            if (text) deliverOrReview(agent, st, 'edit-foldback',
+              '文件内容折返: ' + hit.path, text);
+          }).catch(() => { /* fold-back detection is best-effort */ });
+        }
       } else if (tool === 'Bash') {
         const cmd = extractCmd(exec);
         const n = normCmd(cmd);
@@ -460,7 +614,7 @@ export function apply(ctx, config) {
         st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec)), ok: false });
         st.recentLog = st.recentLog.slice(-cfg.reviewLogSize);
         if (st.failStreak >= cfg.failStreakThreshold
-            && now - st.lastFailReminderAt >= cfg.failCooldownSec * 1000
+            && now - st.lastFailReminderAt >= kindCooldown('fail-loop', cfg.failCooldownSec * 1000)
             && st.reminders < cfg.maxReminders && cfg.enabled) {
           st.reminders += 1;
           st.lastReminderAt = now;
@@ -477,6 +631,13 @@ export function apply(ctx, config) {
           }
           deliverOrReview(agent, st, 'fail-loop',
             '连续失败 ' + st.failStreak + ' 次', text);
+          if (cfg.lessons) {
+            const lastFail = [...st.recentLog].reverse().find((e) => !e.ok);
+            if (lastFail) {
+              registerLesson(normCmd(lastFail.brief) || '未知模式',
+                '连续失败 ' + st.failStreak + ' 次后被打断——换方法前请先读错误定位根因,勿重复此方式');
+            }
+          }
           st.failStreak = 0;
           return;
         }
@@ -488,13 +649,15 @@ export function apply(ctx, config) {
 
       if (!cfg.enabled) return;
 
+      evaluatePending(st);
+
       // triggers, strongest evidence first
       if (st.callsSinceReminder >= cfg.repeatMinCalls) {
         const exact = exactRepeatHit(st, cfg);
         if (exact) {
           const text = fire(st, cfg, now, 'exact-repeat', nudgeText(st, cfg, now,
             '完全相同的命令已原样执行 ' + exact.count + ' 次:`' + exact.raw.slice(0, 120)
-            + '`。同样的输入必然得到同样的结果——请换参数、换方法,或停下来重新评估。'), cfg.cooldownSec * 1000);
+            + '`。同样的输入必然得到同样的结果——请换参数、换方法,或停下来重新评估。'), kindCooldown('exact-repeat', cfg.cooldownSec * 1000));
           if (text) { deliverOrReview(agent, st, 'exact-repeat',
             '原样命令重复 ' + exact.count + ' 次: ' + exact.raw.slice(0, 100), text); return; }
         }
@@ -502,7 +665,7 @@ export function apply(ctx, config) {
         if (repeat) {
           const text = fire(st, cfg, now, 'repeat-cmds', nudgeText(st, cfg, now,
             '检测到重复执行:归一化后为 "' + repeat.prefix + ' …" 的命令在本段已出现 '
-            + repeat.count + ' 次。同样的命令大概率得到同样的结果——请换参数、换思路,或停下来重新评估。'), cfg.cooldownSec * 1000);
+            + repeat.count + ' 次。同样的命令大概率得到同样的结果——请换参数、换思路,或停下来重新评估。'), kindCooldown('repeat-cmds', cfg.cooldownSec * 1000));
           if (text) { deliverOrReview(agent, st, 'repeat-cmds',
             '相似命令重复 ' + repeat.count + ' 次: ' + repeat.prefix, text); return; }
         }
@@ -511,23 +674,48 @@ export function apply(ctx, config) {
           && st.callsSinceReminder >= cfg.longRunMinCalls) {
         const text = fire(st, cfg, now, 'long-run', nudgeText(st, cfg, now,
           '本段会话已持续约 ' + minutesSince(st, now).toFixed(0)
-          + ' 分钟,还没有任何文件被修改。如果当前路径走不通,请考虑向用户说明卡点,而不是继续消耗时间。'), cfg.cooldownSec * 1000);
+          + ' 分钟,还没有任何文件被修改。如果当前路径走不通,请考虑向用户说明卡点,而不是继续消耗时间。'), kindCooldown('long-run', cfg.cooldownSec * 1000));
         if (text) { deliverOrReview(agent, st, 'long-run',
           '运行 ' + minutesSince(st, now).toFixed(0) + ' 分钟零修改', text); return; }
       }
       if (st.callsSinceReminder >= cfg.callNudgeInterval && st.editsSinceReminder === 0) {
         const text = fire(st, cfg, now, 'no-output', nudgeText(st, cfg, now,
           '自上次审查以来 ' + st.callsSinceReminder
-          + ' 次工具调用没有产生任何文件修改——要么是在合理地调研,要么是在空跑。请用证据判断是哪一种。'), cfg.cooldownSec * 1000);
+          + ' 次工具调用没有产生任何文件修改——要么是在合理地调研,要么是在空跑。请用证据判断是哪一种。'), kindCooldown('no-output', cfg.cooldownSec * 1000));
         if (text) { deliverOrReview(agent, st, 'no-output',
           st.callsSinceReminder + ' 次调用零修改', text); return; }
       }
+      // goal-drift patrol (v0.5): every N calls, the reviewer checks whether
+      // current behavior still serves the original goal; silent when on-track
+      if (cfg.driftCheck && reviewer.ready
+          && st.toolCalls - st.callsAtLastDrift >= cfg.driftCheckCalls
+          && now - st.lastDriftAt >= cfg.driftCooldownSec * 1000) {
+        st.lastDriftAt = now;
+        st.callsAtLastDrift = st.toolCalls;
+        st.driftChecks += 1;
+        const material = buildReviewMaterial(st, cfg, now, 'goal-drift', '巡检:目标对齐');
+        const driftSignal = typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+          ? AbortSignal.timeout(cfg.llmTimeoutMs) : undefined;
+        reviewer.review(agent, material, driftSignal, REVIEW_DRIFT_SYSTEM).then((raw) => {
+          const verdict = parseVerdict(raw);
+          if (verdict && verdict.verdict !== 'on-track') {
+            deliver(agent, ctx, '🎯 【AI 抬头 · 目标漂移巡检】判定: ' + (DRIFT_LABEL[verdict.verdict] ?? verdict.verdict)
+              + '\n漂移表现: ' + (verdict.reason || '(未给出)')
+              + '\n收束建议: ' + (verdict.suggestion || '(未给出)')
+              + '\n请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。');
+          }
+        }).catch((error) => {
+          ctx?.logger?.warn?.('[ai-look-up] drift patrol failed: %o', error);
+        });
+      }
       // local clock anchor, lowest priority; quiet within 2 minutes of a nudge
       if (cfg.clockTick && now - st.lastReminderAt >= 120000) {
-        const tickMs = cfg.clockTickMinutes * 60000;
+        const interval = st.clockInterval || cfg.clockTickMinutes;
+        const tickMs = (cfg.clockTickBackoff ? interval : cfg.clockTickMinutes) * 60000;
         if (now - st.lastClockTickAt >= tickMs && minutesSince(st, now) >= cfg.clockTickMinutes) {
           st.lastClockTickAt = now;
           st.clockTicks += 1;
+          st.clockInterval = Math.min(Math.max(interval * 2, 1), cfg.clockTickMaxMinutes);
           deliver(agent, ctx, clockText(st, now));
         }
       }

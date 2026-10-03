@@ -30,7 +30,16 @@ argument-hint: "[要调整的参数=新值, 或留空查看]"
 | `stop_check` | `true` | 结束时若长期零产出,请求一次继续以复盘 |
 | `stop_min_calls` | `40` | 结束审查要求的最低调用数 |
 | `clock_tick` | `true` | 定期注入真实本地时间,校准 AI 时间感 |
-| `clock_tick_minutes` | `10` | 时钟注入的间隔(分钟) |
+| `clock_tick_minutes` | `5` | 首次时钟锚点的间隔(分钟),之后倍增 |
+| `clock_tick_backoff` | `true` | 时钟间隔倍增(5→10→20→40),新回合重置 |
+| `clock_tick_max_minutes` | `60` | 时钟间隔封顶(分钟) |
+| `edit_foldback` | `true` | 文件内容改了又改回 → 折返提醒 |
+| `foldback_window` | `5` | 每文件记录的内容指纹个数 |
+| `adaptive` | `true` | 按提醒历史有效率自适应冷却 |
+| `drift_check` | `true` | 目标漂移巡检(需审查者可用) |
+| `drift_check_calls` | `30` | 每 N 次调用巡检一次 |
+| `drift_cooldown_sec` | `900` | 巡检冷却(秒) |
+| `lessons` | `true` | 教训登记簿:失败登记坑位,回合开始注入 Top 3 |
 | `llm_review` | `false` | 触发提醒时用独立 LLM 上下文审查是否空跑 |
 | `llm_api_base` | `https://api.deepseek.com` | OpenAI 兼容接口地址 |
 | `llm_api_key` | 空 | 接口密钥,填写后审查才生效 |

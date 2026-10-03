@@ -25,6 +25,7 @@ ai-look-up —— AI 抬头钩子(核心检测脚本)
     lookup_hook.py reset       # 删除状态文件(重置监控)
 """
 
+import hashlib
 import json
 import os
 import re
@@ -59,9 +60,13 @@ DEFAULTS = {
     # 结束时若长期零产出的会话,请求一次继续以强制复盘
     "stop_check": True,
     "stop_min_calls": 40,
-    # 本地时钟锚点:每 N 分钟注入一次真实本地时间,校准 AI 的时间感
+    # 本地时钟锚点:每 N 分钟注入一次真实本地时间,校准 AI 的时间感。
+    # backoff 开启时间隔倍增(10→20→40→封顶),省上下文;准确性不受影响——
+    # 每次注入的都是插件从真实时钟现算的值,不存在虚拟漂移。
     "clock_tick": True,
-    "clock_tick_minutes": 10,
+    "clock_tick_minutes": 5,
+    "clock_tick_backoff": True,
+    "clock_tick_max_minutes": 60,
     # 独立审查者:触发提醒时直调一次 OpenAI 兼容接口,用独立上下文判定是否空跑。
     # 默认关闭;在配置文件里给出 llm_api_key 后启用(DeepSeek: api_base 保持默认
     # https://api.deepseek.com,model deepseek-chat)。失败/超时回退静态清单。
@@ -71,9 +76,20 @@ DEFAULTS = {
     "llm_model": "deepseek-chat",
     "llm_timeout_sec": 12,
     "review_log_size": 12,
+    # A) 折返编辑检测:同一文件的内容回到先前见过的状态(改了又改回)= 原地打转
+    "edit_foldback": True,
+    "foldback_window": 5,
+    # C) 提醒有效性自适应:按历史有效率调整各类提醒的冷却(有效→更勤,无效→降噪)
+    "adaptive": True,
+    # 目标漂移巡检:每 N 次调用用独立审查者对照最初目标,抓"子任务喧宾夺主"
+    "drift_check": True,
+    "drift_check_calls": 30,
+    "drift_cooldown_sec": 900,
+    # 教训登记簿:失败循环自动登记坑位,回合开始时注入 Top 教训,防"认坑后再踩"
+    "lessons": True,
 }
 
-BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review"}
+BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review", "edit_foldback", "adaptive", "drift_check", "lessons", "clock_tick_backoff"}
 
 REVIEW_SYSTEM = (
     "你是 AI 编码代理的独立行为审查员。主代理看不到你的存在,你只依据给它的任务描述"
@@ -85,6 +101,157 @@ REVIEW_SYSTEM = (
 )
 
 VERDICT_LABEL = {"on-track": "仍在正轨", "drifting": "有偏航迹象", "stuck": "空跑确认"}
+
+DRIFT_LABEL = {"on-track": "仍在服务主线", "drifting": "子任务喧宾夺主", "stuck": "已明显偏离主线"}
+
+REVIEW_DRIFT_SYSTEM = (
+    "你是 AI 编码代理的目标漂移审查员。主代理看不到你的存在。长上下文任务最常见的失败是:"
+    "最初为核验某个决定而展开的子任务,做着做着变成了独立目标,喧宾夺主。"
+    "你只依据最初任务描述与最近工具调用记录判断:当前行为是否仍在服务最初目标,"
+    "还是某个子任务已经扩张成了事实上的新目标。只输出一个 JSON 对象,不要输出任何其他文字:\n"
+    '{"verdict":"on-track|drifting|stuck","reason":"一句话:当前行为与最初目标的关系","suggestion":"一句话:如何收束"}\n'
+    "on-track=仍在服务主线;drifting=子任务喧宾夺主;stuck=已明显偏离主线。"
+)
+
+
+def adaptive_path():
+    return os.path.join(state_dir(), "adaptive.json")
+
+
+def load_adaptive():
+    try:
+        with open(adaptive_path(), encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_adaptive(stats):
+    try:
+        with open(adaptive_path(), "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def kind_cooldown(cfg, kind, base):
+    """按该类提醒的历史有效率调整冷却:无效(<30%)翻倍降噪,有效(>70%)缩短到 3/4。"""
+    if not cfg.get("adaptive"):
+        return base
+    stats = load_adaptive().get(kind)
+    if not stats or stats.get("fired", 0) < 5:
+        return base
+    rate = stats["effective"] / max(1, stats["fired"])
+    if rate < 0.3:
+        return min(base * 2, base * 4)
+    if rate > 0.7:
+        return max(base * 0.75, 60)
+    return base
+
+
+def evaluate_pending(state, cfg):
+    """提醒发出 10 次调用后结算有效性:期间出现修改/失败停止/命令模式变化都算有效。"""
+    pending = state.get("pending_reminders", [])
+    if not pending:
+        return
+    remaining = []
+    changed = False
+    for p in pending:
+        if state["tool_calls"] - p["calls_at"] < 10:
+            remaining.append(p)
+            continue
+        effective = (state["edits"] - p["edits_at"] > 0) or (
+            state["fail_streak"] == 0 and p["fail"] > 0)
+        if not effective:
+            cur = state.get("recent_cmds", [])
+            n_last = cur[-1]["n"] if cur else ""
+            effective = bool(n_last) and n_last != p.get("norm", "")
+        stats = load_adaptive()
+        s = stats.setdefault(p["kind"], {"fired": 0, "effective": 0})
+        s["fired"] = s.get("fired", 0) + 1
+        if effective:
+            s["effective"] = s.get("effective", 0) + 1
+        save_adaptive(stats)
+        changed = True
+    if changed or remaining != pending:
+        state["pending_reminders"] = remaining
+
+
+def lessons_path():
+    return os.path.join(state_dir(), "lessons.json")
+
+
+def register_lesson(pattern, correction):
+    """登记/累加一条坑位教训;同模式合并,hits 记录被踩次数。"""
+    if not pattern:
+        return
+    try:
+        with open(lessons_path(), encoding="utf-8") as f:
+            lessons = json.load(f)
+        lessons = lessons if isinstance(lessons, list) else []
+    except Exception:
+        lessons = []
+    for entry in lessons:
+        if entry.get("pattern") == pattern:
+            entry["hits"] = entry.get("hits", 1) + 1
+            entry["correction"] = correction
+            entry["last_seen"] = time.time()
+            break
+    else:
+        lessons.append({"pattern": pattern, "correction": correction,
+                        "hits": 1, "last_seen": time.time()})
+    lessons.sort(key=lambda e: -e.get("hits", 1))
+    try:
+        with open(lessons_path(), "w", encoding="utf-8") as f:
+            json.dump(lessons[:50], f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def top_lessons(n=3):
+    try:
+        with open(lessons_path(), encoding="utf-8") as f:
+            lessons = json.load(f)
+        return [e for e in lessons if isinstance(e, dict)][:n]
+    except Exception:
+        return []
+
+
+def lessons_text():
+    lessons = top_lessons(3)
+    if not lessons:
+        return None
+    lines = ["📚 【AI 抬头 · 已知坑位】此前的会话在这些地方踩过坑,请勿重复:"]
+    for i, e in enumerate(lessons, 1):
+        lines.append("{i}. [{hits} 次] {p} —— {c}".format(
+            i=i, hits=e.get("hits", 1), p=e["pattern"], c=e.get("correction", "")))
+    return "\n".join(lines)
+
+
+def record_edit_hash(state, cfg, data):
+    """记录 Edit/Write 后文件内容的短 hash;内容回到先前见过的状态 → 折返(返回 True)。"""
+    ti = data.get("tool_input") or data.get("toolInput") or {}
+    if not isinstance(ti, dict):
+        return False
+    path = ti.get("file_path") or ti.get("path") or ti.get("notebook_path")
+    if not path:
+        return False
+    path = os.path.abspath(str(path))
+    try:
+        with open(path, "rb") as f:
+            h = hashlib.md5(f.read()).hexdigest()[:12]
+    except Exception:
+        return False
+    hashes = state.setdefault("file_hashes", {})
+    seen = hashes.setdefault(path, [])
+    hit = len(seen) >= 1 and h in seen[:-1]
+    seen.append(h)
+    hashes[path] = seen[-cfg["foldback_window"]:]
+    if len(hashes) > 16:
+        for k in list(hashes)[:-16]:
+            hashes.pop(k, None)
+    return hit
 
 
 def load_config():
@@ -183,9 +350,15 @@ def new_state(sid, now):
         "prompt_resets": 0,
         "last_clock_tick_at": 0.0,
         "clock_ticks": 0,
+        "clock_interval": 0,
         "recent_log": [],
         "last_goal": "",
         "reviews": 0,
+        "file_hashes": {},
+        "pending_reminders": [],
+        "drift_checks": 0,
+        "last_drift_at": 0.0,
+        "calls_at_last_drift": 0,
     }
 
 
@@ -212,13 +385,14 @@ def save_state(sid, state):
         pass
 
 
-def reset_stretch(state, now):
+def reset_stretch(state, cfg, now):
     """开启新的工作时段:重置回合内的节奏计数,保留会话累计。"""
     state["started_at"] = now
     state["calls_since_reminder"] = 0
     state["edits_since_reminder"] = 0
     state["fail_streak"] = 0
     state["recent_cmds"] = []
+    state["clock_interval"] = 0
 
 
 def extract_cmd(data):
@@ -305,6 +479,16 @@ def fire(state, cfg, now, kind, text, cooldown):
     state["last_trigger"] = kind
     state["calls_since_reminder"] = 0
     state["edits_since_reminder"] = 0
+    cur = state.get("recent_cmds", [])
+    pending = state.setdefault("pending_reminders", [])
+    pending.append({
+        "kind": kind,
+        "calls_at": state["tool_calls"],
+        "edits_at": state["edits"],
+        "fail": state["fail_streak"],
+        "norm": cur[-1]["n"] if cur else "",
+    })
+    state["pending_reminders"] = pending[-10:]
     return text
 
 
@@ -368,7 +552,7 @@ def build_review_material(state, cfg, now, kind, detail):
     return "\n".join(parts)
 
 
-def call_llm_review(state, cfg, now, kind, detail):
+def call_llm_review(state, cfg, now, kind, detail, system=REVIEW_SYSTEM):
     """直调一次 OpenAI 兼容接口,返回解析后的 verdict dict;任何失败返回 None。"""
     api_key = cfg.get("llm_api_key") or ""
     if not api_key:
@@ -379,7 +563,7 @@ def call_llm_review(state, cfg, now, kind, detail):
         "temperature": 0,
         "max_tokens": 200,
         "messages": [
-            {"role": "system", "content": REVIEW_SYSTEM},
+            {"role": "system", "content": system},
             {"role": "user", "content": material},
         ],
     }).encode("utf-8")
@@ -451,7 +635,7 @@ def stop_output(reason):
 
 def handle_post_use(cfg, data, state, now):
     if now - state.get("last_event_at", now) > STALE_AFTER_SEC:
-        reset_stretch(state, now)
+        reset_stretch(state, cfg, now)
     state["last_event_at"] = now
     tool = str(data.get("tool_name") or data.get("toolName") or "Unknown")
     state["tool_calls"] += 1
@@ -462,6 +646,10 @@ def handle_post_use(cfg, data, state, now):
     if tool in PRODUCTIVE_TOOLS:
         state["edits"] += 1
         state["edits_since_reminder"] += 1
+        if cfg["edit_foldback"] and record_edit_hash(state, cfg, data):
+            state["foldback_hit"] = True
+            ti = data.get("tool_input") or data.get("toolInput") or {}
+            state["foldback_path"] = str((ti.get("file_path") or ti.get("path") or ti.get("notebook_path") or "?"))[:120]
     elif tool == "Bash":
         cmd = extract_cmd(data)
         n = norm_cmd(cmd)
@@ -474,8 +662,30 @@ def handle_post_use(cfg, data, state, now):
     log.append({"tool": tool, "brief": (extract_cmd(data) or "")[:100], "ok": True})
     state["recent_log"] = log[-cfg["review_log_size"]:]
 
+    # ── 提醒有效性结算(自适应) ──
+    evaluate_pending(state, cfg)
+
     # ── 触发器按证据强度排序,命中第一个即返回 ──
-    # 0) 完全相同的命令原样重复(参数级,证据最强)
+    # 0a) 折返编辑:文件内容改了又改回
+    if cfg["edit_foldback"] and state.get("foldback_hit"):
+        state["foldback_hit"] = False
+        fb_path = state.get("foldback_path", "")
+        text = fire(
+            state, cfg, now, "edit-foldback",
+            nudge_text(
+                state, cfg, now,
+                "文件 {p} 的内容回到了先前见过的状态——改了又改回是典型的原地打转,"
+                "请确认这条修改路径是否还有意义,或者你已经在这个文件上折返了多次。".format(
+                    p=fb_path),
+            ),
+            kind_cooldown(cfg, "edit-foldback", cfg["cooldown_sec"]),
+        )
+        if text:
+            return post_use_output(finalize_text(
+                state, cfg, now, "edit-foldback",
+                "文件内容折返: {p}".format(p=fb_path),
+                text))
+    # 0b) 完全相同的命令原样重复(参数级,证据最强)
     if state["calls_since_reminder"] >= cfg["repeat_min_calls"]:
         hit = exact_repeat_hit(state, cfg)
         if hit:
@@ -487,7 +697,7 @@ def handle_post_use(cfg, data, state, now):
                     "同样的输入必然得到同样的结果——请换参数、换方法,或停下来重新评估。".format(
                         n=hit["count"], cmd=hit["raw"][:120]),
                 ),
-                cfg["cooldown_sec"],
+                kind_cooldown(cfg, "exact-repeat", cfg["cooldown_sec"]),
             )
             if text:
                 return post_use_output(finalize_text(
@@ -506,7 +716,7 @@ def handle_post_use(cfg, data, state, now):
                     "同样的命令大概率得到同样的结果——请换参数、换思路,或停下来重新评估。".format(
                         p=hit["prefix"], n=hit["count"]),
                 ),
-                cfg["cooldown_sec"],
+                kind_cooldown(cfg, "repeat-cmds", cfg["cooldown_sec"]),
             )
             if text:
                 return post_use_output(finalize_text(
@@ -525,7 +735,7 @@ def handle_post_use(cfg, data, state, now):
                 "如果当前路径走不通,请考虑向用户说明卡点,而不是继续消耗时间。".format(
                     m=fmt_minutes(state, now)),
             ),
-            cfg["cooldown_sec"],
+            kind_cooldown(cfg, "long-run", cfg["cooldown_sec"]),
         )
         if text:
             return post_use_output(finalize_text(
@@ -543,20 +753,42 @@ def handle_post_use(cfg, data, state, now):
                 "要么是在合理地调研,要么是在空跑。请用证据判断是哪一种。".format(
                     c=state["calls_since_reminder"]),
             ),
-            cfg["cooldown_sec"],
+            kind_cooldown(cfg, "no-output", cfg["cooldown_sec"]),
         )
         if text:
             return post_use_output(finalize_text(
                 state, cfg, now, "no-output",
                 "{c} 次调用零修改".format(c=state["calls_since_reminder"]),
                 text))
+    # 3.5) 目标漂移巡检:每 N 次调用用独立审查者对照最初目标(需要 llm_api_key)
+    if (cfg["drift_check"] and cfg.get("llm_api_key")
+            and state["tool_calls"] - state.get("calls_at_last_drift", 0) >= cfg["drift_check_calls"]
+            and now - state.get("last_drift_at", 0.0) >= cfg["drift_cooldown_sec"]):
+        state["last_drift_at"] = now
+        state["calls_at_last_drift"] = state["tool_calls"]
+        state["drift_checks"] = state.get("drift_checks", 0) + 1
+        verdict = call_llm_review(state, cfg, now, "goal-drift", "巡检:目标对齐",
+                                  system=REVIEW_DRIFT_SYSTEM)
+        if verdict and verdict["verdict"] in ("drifting", "stuck"):
+            state["reviews"] = state.get("reviews", 0) + 1
+            return post_use_output(
+                "🎯 【AI 抬头 · 目标漂移巡检】判定: " + DRIFT_LABEL[verdict["verdict"]]
+                + "\n漂移表现: " + (verdict["reason"] or "(未给出)")
+                + "\n收束建议: " + (verdict["suggestion"] or "(未给出)")
+                + "\n请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。")
+
     # 4) 本地时钟锚点(最低优先级:空跑提醒优先,且其刚发出 2 分钟内时钟静默)
     if cfg["clock_tick"] and now - state.get("last_reminder_at", 0.0) >= 120:
-        tick_sec = cfg["clock_tick_minutes"] * 60
+        interval = state.get("clock_interval") or cfg["clock_tick_minutes"]
+        tick_sec = interval * 60
         if (now - state.get("last_clock_tick_at", 0.0) >= tick_sec
                 and fmt_minutes(state, now) >= cfg["clock_tick_minutes"]):
             state["last_clock_tick_at"] = now
             state["clock_ticks"] = state.get("clock_ticks", 0) + 1
+            if cfg["clock_tick_backoff"]:
+                state["clock_interval"] = min(max(interval * 2, 1), cfg["clock_tick_max_minutes"])
+            else:
+                state["clock_interval"] = cfg["clock_tick_minutes"]
             return post_use_output(clock_text(state, now))
     return None
 
@@ -571,7 +803,7 @@ def handle_post_fail(cfg, data, state, now):
     state["recent_log"] = log[-cfg["review_log_size"]:]
     if state["fail_streak"] < cfg["fail_streak_threshold"]:
         return None
-    if now - state.get("last_fail_reminder_at", 0.0) < cfg["fail_cooldown_sec"]:
+    if now - state.get("last_fail_reminder_at", 0.0) < kind_cooldown(cfg, "fail-loop", cfg["fail_cooldown_sec"]):
         return None
     if state["reminders"] >= cfg["max_reminders"] or not cfg["enabled"]:
         return None
@@ -591,6 +823,12 @@ def handle_post_fail(cfg, data, state, now):
             n=state["reminders"] + 1)
     streak = state["fail_streak"]
     state["fail_streak"] = 0
+    if cfg.get("lessons"):
+        last_fail = next((e for e in reversed(state.get("recent_log", [])) if not e.get("ok")), None)
+        if last_fail:
+            register_lesson(
+                norm_cmd(last_fail.get("brief", "")) or "未知模式",
+                "连续失败 {n} 次后被打断——换方法前请先读错误定位根因,勿重复此方式".format(n=streak))
     return post_fail_output(finalize_text(
         state, cfg, now, "fail-loop",
         "连续失败 {n} 次".format(n=streak),
@@ -600,11 +838,21 @@ def handle_post_fail(cfg, data, state, now):
 def handle_prompt(cfg, data, state, now):
     state["last_event_at"] = now
     state["prompt_resets"] += 1
-    reset_stretch(state, now)
+    reset_stretch(state, cfg, now)
     # 捕获任务描述,供独立审查者使用(尽力而为)
     goal = data.get("prompt") or data.get("user_prompt") or ""
     if isinstance(goal, str) and goal.strip():
         state["last_goal"] = goal.strip()[:400]
+    # 回合开始即注入历史教训,防"认坑后再踩"
+    if cfg.get("lessons"):
+        lt = lessons_text()
+        if lt:
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "UserPromptSubmit",
+                    "additionalContext": lt,
+                }
+            }
     return None
 
 
@@ -619,7 +867,7 @@ def handle_stop(cfg, data, state, now):
             and fmt_minutes(state, now) >= cfg["long_run_minutes"]):
         elapsed = fmt_minutes(state, now)
         state["stop_blocks"] = state.get("stop_blocks", 0) + 1
-        reset_stretch(state, now)
+        reset_stretch(state, cfg, now)
         reason = "\n".join([
             "🔔 【AI 抬头 · 结束前审查】这轮会话累计 {c} 次工具调用、约 {m:.0f} 分钟,"
             "但没有任何文件被修改。在结束回复之前,请先:".format(
