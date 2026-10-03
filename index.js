@@ -102,13 +102,12 @@ function registerLesson(pattern, correction) {
   }
 }
 
-let lastLessonsSig = '';
-function lessonsMessage() {
+function lessonsMessage(state) {
   if (!lessonsLedger.size) return null;
   const top = [...lessonsLedger.values()].sort((a, b) => b.hits - a.hits).slice(0, 3);
   const sig = top.map((e) => e.pattern + 'x' + e.hits).join('|');
-  if (sig === lastLessonsSig) return null;
-  lastLessonsSig = sig;
+  if (state.lessonsSig === sig) return null;
+  state.lessonsSig = sig;
   const lines = ['📚 【AI 抬头 · 已知坑位】请勿重复:'];
   top.forEach((e, i) => lines.push((i + 1) + '. [' + e.hits + ' 次] ' + e.pattern + ' —— ' + e.correction));
   return lines.join('\n');
@@ -201,7 +200,7 @@ function freshState() {
     goal: '',
     reminders: 0, lastReminderAt: 0, lastFailReminderAt: 0, lastTrigger: '',
     stopBlocks: 0, promptResets: 0, lastClockTickAt: 0, clockTicks: 0,
-    reviewInFlight: false,
+    reviewInFlight: false, lessonsSig: '',
     fileHashes: {}, pendingReminders: [],
     driftChecks: 0, lastDriftAt: 0, callsAtLastDrift: 0,
     clockInterval: 0,
@@ -505,7 +504,7 @@ export function apply(ctx, config) {
   ctx.on('agent/created', (agent) => {
     state.set(agent, freshState());
     if (cfg.lessons) {
-      const known = lessonsMessage();
+      const known = lessonsMessage(stateOf(agent));
       if (known) deliver(agent, ctx, known);
     }
     try {
