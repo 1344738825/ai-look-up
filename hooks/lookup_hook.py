@@ -218,11 +218,17 @@ def top_lessons(n=3):
         return []
 
 
-def lessons_text():
+def lessons_text(state):
     lessons = top_lessons(3)
     if not lessons:
         return None
-    lines = ["📚 【AI 抬头 · 已知坑位】此前的会话在这些地方踩过坑,请勿重复:"]
+    # 内容没变就不重复注入(每 5 个回合强制重注一次,防上下文压缩后丢失)
+    sig = "|".join("{}x{}".format(e["pattern"], e.get("hits", 1)) for e in lessons)
+    count = state.get("prompt_resets", 0)
+    if state.get("lessons_sig") == sig and count % 5 != 0:
+        return None
+    state["lessons_sig"] = sig
+    lines = ["📚 【AI 抬头 · 已知坑位】请勿重复:"]
     for i, e in enumerate(lessons, 1):
         lines.append("{i}. [{hits} 次] {p} —— {c}".format(
             i=i, hits=e.get("hits", 1), p=e["pattern"], c=e.get("correction", "")))
@@ -354,6 +360,7 @@ def new_state(sid, now):
         "recent_log": [],
         "last_goal": "",
         "reviews": 0,
+        "lessons_sig": "",
         "file_hashes": {},
         "pending_reminders": [],
         "drift_checks": 0,
@@ -499,32 +506,25 @@ def local_hm(ts):
 def nudge_text(state, cfg, now, specific):
     mins = fmt_minutes(state, now)
     lines = [
-        "🔔 【AI 抬头 · 中途自我审查】当前本地时间 {h},本段任务已运行 {m:.0f} 分钟"
-        "(开始于 {hs}),{c} 次工具调用,期间文件修改 {e} 次。"
-        "请暂停手头的操作,抬头检查:".format(
-            h=local_hm(now), m=mins, hs=local_hm(state.get("started_at", now)),
+        "🔔 【AI 抬头 · 中途自我审查】时钟 {h},本段 {m:.0f} 分钟/{c} 次调用,修改 {e} 次。自查:".format(
+            h=local_hm(now), m=mins,
             c=state["calls_since_reminder"], e=state["edits_since_reminder"]),
-        "1. 对照最初目标:当前进展到哪一步?是否已经偏离?",
-        "2. 最近 5 次工具调用各带来了什么新信息?如果没有新信息,说明正在空跑。",
+        "① 对照最初目标是否偏移?② 最近 5 次调用有无新信息?若无 → 正在空跑。",
     ]
     if specific:
-        lines.append("3. " + specific)
-        lines.append("4. 用一句话得出结论:继续 / 换方法 / 先向用户汇报,然后再继续工作。")
-    else:
-        lines.append("3. 用一句话得出结论:继续 / 换方法 / 先向用户汇报,然后再继续工作。")
+        lines.append("③ " + specific)
+    lines.append("→ 一句话结论:继续 / 换方法 / 先向用户汇报,然后再继续。")
     if state.get("reminders", 0) >= 3:
         lines.append(
-            "⚠️ 这已是本会话第 {n} 次提醒,之前的提醒后仍没有改善。"
-            "请认真考虑:停止当前方法,直接向用户汇报现状与卡点,请求指示。".format(
+            "⚠️ 第 {n} 次提醒仍无改善——停止当前方法,直接向用户汇报卡点。".format(
                 n=state["reminders"] + 1))
     return "\n".join(lines)
 
 
 def clock_text(state, now):
     return (
-        "🕐 【AI 抬头 · 本地时钟】当前本地时间 {h},本段任务开始于 {hs},已进行 {m:.0f} 分钟。"
-        "AI 对时间流逝的感觉不可靠:凡是要向用户预估或汇报耗时、判断是否超时,"
-        "请一律以这个真实时钟为准,不要自己估算。"
+        "🕐 【AI 抬头 · 本地时钟】{h},已进行 {m:.0f} 分钟(开始于 {hs})。"
+        "耗时预估/汇报以此为准,勿自估。"
     ).format(h=local_hm(now), hs=local_hm(state.get("started_at", now)), m=fmt_minutes(state, now))
 
 
@@ -532,23 +532,22 @@ def build_review_material(state, cfg, now, kind, detail):
     log_lines = [
         "{i}. [{t}{ok}] {b}".format(
             i=i + 1, t=e.get("tool", "?"),
-            ok="" if e.get("ok") else " ✗失败",
-            b=e.get("brief") or "(无参数摘要)")
-        for i, e in enumerate(state.get("recent_log", [])[-cfg["review_log_size"]:])
+            ok="" if e.get("ok") else " ✗",
+            b=(e.get("brief") or "无")[:60])
+        for i, e in enumerate(state.get("recent_log", [])[-min(8, cfg["review_log_size"]):])
     ]
     parts = [
-        "【审查材料】触发原因: " + kind,
-        "【原始任务】" + (state.get("last_goal") or "(未捕获到任务描述)"),
-        "【统计】本段运行 {m:.0f} 分钟,共 {c} 次工具调用,文件修改 {e} 次,"
-        "当前连续失败 {f} 次,累计失败 {t} 次。".format(
+        "【审查材料】触发: " + kind,
+        "【任务】" + (state.get("last_goal") or "(未捕获)")[:200],
+        "【统计】{m:.0f} 分钟/{c} 次调用/修改 {e},连败 {f},累计败 {t}。".format(
             m=fmt_minutes(state, now), c=state.get("tool_calls", 0),
             e=state.get("edits", 0), f=state.get("fail_streak", 0),
             t=state.get("total_failures", 0)),
-        "【最近工具调用(旧→新)】",
+        "【最近调用(旧→新)】",
     ]
     parts.extend(log_lines)
     if detail:
-        parts.append("【触发细节】" + detail)
+        parts.append("【细节】" + detail)
     return "\n".join(parts)
 
 
@@ -598,17 +597,21 @@ def call_llm_review(state, cfg, now, kind, detail, system=REVIEW_SYSTEM):
 
 
 def finalize_text(state, cfg, now, kind, detail, static_text):
-    """提醒发出前的最后一站:llm_review 开启时追加独立审查结论,失败回退静态文案。"""
+    """提醒发出前的最后一站:llm_review 开启时追加独立审查结论,失败回退静态文案。
+    on-track 判定用短确认替代完整清单,省上下文。"""
     if not cfg.get("llm_review"):
         return static_text
     verdict = call_llm_review(state, cfg, now, kind, detail)
     if verdict is None:
         return static_text
     state["reviews"] = state.get("reviews", 0) + 1
-    return (static_text + "\n\n🔎 【AI 抬头 · 独立审查】判定: " + VERDICT_LABEL[verdict["verdict"]]
-            + "\n审查依据: " + (verdict["reason"] or "(未给出)")
-            + "\n审查建议: " + (verdict["suggestion"] or "(未给出)")
-            + "\n请针对以上结论,用一句话决定:继续 / 换方法 / 先向用户汇报。")
+    if verdict["verdict"] == "on-track":
+        return (static_text.split("\n")[0]
+                + "\n🔎 【AI 抬头 · 独立审查】仍在正轨(" + (verdict["reason"] or "无异常")
+                + ")——保持节奏。")
+    return (static_text + "\n🔎 【AI 抬头 · 独立审查】" + VERDICT_LABEL[verdict["verdict"]]
+            + "(" + (verdict["reason"] or "未给出") + ")建议:"
+            + (verdict["suggestion"] or "未给出"))
 
 
 def post_use_output(text):
@@ -843,9 +846,9 @@ def handle_prompt(cfg, data, state, now):
     goal = data.get("prompt") or data.get("user_prompt") or ""
     if isinstance(goal, str) and goal.strip():
         state["last_goal"] = goal.strip()[:400]
-    # 回合开始即注入历史教训,防"认坑后再踩"
+    # 回合开始即注入历史教训,防"认坑后再踩"(内容未变则跳过,每 5 回合强制重注)
     if cfg.get("lessons"):
-        lt = lessons_text()
+        lt = lessons_text(state)
         if lt:
             return {
                 "hookSpecificOutput": {

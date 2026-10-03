@@ -102,10 +102,14 @@ function registerLesson(pattern, correction) {
   }
 }
 
+let lastLessonsSig = '';
 function lessonsMessage() {
   if (!lessonsLedger.size) return null;
   const top = [...lessonsLedger.values()].sort((a, b) => b.hits - a.hits).slice(0, 3);
-  const lines = ['📚 【AI 抬头 · 已知坑位】此前的会话在这些地方踩过坑,请勿重复:'];
+  const sig = top.map((e) => e.pattern + 'x' + e.hits).join('|');
+  if (sig === lastLessonsSig) return null;
+  lastLessonsSig = sig;
+  const lines = ['📚 【AI 抬头 · 已知坑位】请勿重复:'];
   top.forEach((e, i) => lines.push((i + 1) + '. [' + e.hits + ' 次] ' + e.pattern + ' —— ' + e.correction));
   return lines.join('\n');
 }
@@ -317,44 +321,35 @@ async function recordEditHash(state, cfg, exec) {
 
 function nudgeText(state, cfg, now, specific) {
   const lines = [
-    '🔔 【AI 抬头 · 中途自我审查】当前本地时间 ' + localHm(now)
-      + ',本段任务已运行 ' + minutesSince(state, now).toFixed(0)
-      + ' 分钟(开始于 ' + localHm(state.startedAt)
-      + '),' + state.callsSinceReminder + ' 次工具调用,期间文件修改 '
-      + state.editsSinceReminder + ' 次。请暂停手头的操作,抬头检查:',
-    '1. 对照最初目标:当前进展到哪一步?是否已经偏离?',
-    '2. 最近 5 次工具调用各带来了什么新信息?如果没有新信息,说明正在空跑。',
+    '🔔 【AI 抬头 · 中途自我审查】时钟 ' + localHm(now)
+      + ',本段 ' + minutesSince(state, now).toFixed(0) + ' 分钟/'
+      + state.callsSinceReminder + ' 次调用,修改 ' + state.editsSinceReminder + ' 次。自查:',
+    '① 对照最初目标是否偏移?② 最近 5 次调用有无新信息?若无 → 正在空跑。',
   ];
-  if (specific) {
-    lines.push('3. ' + specific);
-    lines.push('4. 用一句话得出结论:继续 / 换方法 / 先向用户汇报,然后再继续工作。');
-  } else {
-    lines.push('3. 用一句话得出结论:继续 / 换方法 / 先向用户汇报,然后再继续工作。');
-  }
+  if (specific) lines.push('③ ' + specific);
+  lines.push('→ 一句话结论:继续 / 换方法 / 先向用户汇报,然后再继续。');
   if (state.reminders >= 3) {
-    lines.push('⚠️ 这已是本会话第 ' + (state.reminders + 1)
-      + ' 次提醒,之前的提醒后仍没有改善。请认真考虑:停止当前方法,直接向用户汇报现状与卡点,请求指示。');
+    lines.push('⚠️ 第 ' + (state.reminders + 1) + ' 次提醒仍无改善——停止当前方法,直接向用户汇报卡点。');
   }
   return lines.join('\n');
 }
 
-const clockText = (state, now) => '🕐 【AI 抬头 · 本地时钟】当前本地时间 ' + localHm(now)
-  + ',本段任务开始于 ' + localHm(state.startedAt)
-  + ',已进行 ' + minutesSince(state, now).toFixed(0)
-  + ' 分钟。AI 对时间流逝的感觉不可靠:凡是要向用户预估或汇报耗时、判断是否超时,请一律以这个真实时钟为准,不要自己估算。';
+const clockText = (state, now) => '🕐 【AI 抬头 · 本地时钟】' + localHm(now)
+  + ',已进行 ' + minutesSince(state, now).toFixed(0) + ' 分钟(开始于 ' + localHm(state.startedAt)
+  + ')。耗时预估/汇报以此为准,勿自估。';
 
 function buildReviewMaterial(state, cfg, now, kind, detail) {
-  const logLines = state.recentLog.slice(-cfg.reviewLogSize).map((entry, i) =>
-    (i + 1) + '. [' + entry.tool + (entry.ok ? '' : ' ✗失败') + '] ' + (entry.brief || '(无参数摘要)'));
+  const logLines = state.recentLog.slice(-Math.min(8, cfg.reviewLogSize)).map((entry, i) =>
+    (i + 1) + '. [' + entry.tool + (entry.ok ? '' : ' ✗') + '] ' + (entry.brief || '无').slice(0, 60));
   return [
-    '【审查材料】触发原因: ' + kind,
-    '【原始任务】' + (state.goal || '(未捕获到任务描述)'),
-    '【统计】本段运行 ' + minutesSince(state, now).toFixed(0) + ' 分钟,共 '
-      + state.toolCalls + ' 次工具调用,文件修改 ' + state.edits
-      + ' 次,当前连续失败 ' + state.failStreak + ' 次,累计失败 ' + state.totalFailures + ' 次。',
-    '【最近工具调用(旧→新)】',
+    '【审查材料】触发: ' + kind,
+    '【任务】' + (state.goal || '(未捕获)').slice(0, 200),
+    '【统计】' + minutesSince(state, now).toFixed(0) + ' 分钟/' + state.toolCalls
+      + ' 次调用/修改 ' + state.edits + ',连败 ' + state.failStreak + ',累计败 '
+      + state.totalFailures + '。',
+    '【最近调用(旧→新)】',
     ...logLines,
-    detail ? '【触发细节】' + detail : '',
+    detail ? '【细节】' + detail : '',
   ].filter(Boolean).join('\n');
 }
 
@@ -375,10 +370,10 @@ function parseVerdict(text) {
   }
 }
 
-const verdictText = (v) => '🔎 【AI 抬头 · 独立审查】判定: ' + (VERDICT_LABEL[v.verdict] ?? v.verdict)
-  + '\n审查依据: ' + (v.reason || '(未给出)')
-  + '\n审查建议: ' + (v.suggestion || '(未给出)')
-  + '\n请针对以上结论,用一句话决定:继续 / 换方法 / 先向用户汇报。';
+const verdictText = (v) => (v.verdict === 'on-track')
+  ? '🔎 【AI 抬头 · 独立审查】仍在正轨(' + (v.reason || '无异常') + ')——保持节奏。'
+  : '🔎 【AI 抬头 · 独立审查】' + (VERDICT_LABEL[v.verdict] ?? v.verdict)
+    + '(' + (v.reason || '未给出') + ')建议:' + (v.suggestion || '未给出');
 
 /**
  * Build one injectable user message. `agent.inject()` and
