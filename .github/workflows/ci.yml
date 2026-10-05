@@ -14,9 +14,17 @@ jobs:
         with:
           python-version: "3.12"
       - name: compile
-        run: python -m py_compile hooks/lookup_hook.py
+        run: python -m py_compile hooks/lookup_hook.py hooks/lookup_watcher.py
       - name: golden conformance (Python side)
         run: python test/golden_check.py
+      - name: third-channel end-to-end
+        run: python test/channel_check.py
+      - name: cross-process state lock
+        run: python test/lock_check.py
+      - name: revert-verification (defenses must be real)
+        run: python test/revert_verify.py
+        env:
+          NODE_BIN: node
 
   node:
     runs-on: ubuntu-latest

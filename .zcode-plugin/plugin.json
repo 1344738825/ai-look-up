@@ -1,6 +1,6 @@
 {
   "name": "ai-look-up",
-  "version": "0.6.1",
+  "version": "0.7.0",
   "description": "Detects aimless AI grinding (repeated commands, failure loops, long runs with no output) and injects mid-run self-review nudges plus real local-time anchors via hooks, so the AI looks up, re-checks progress and calibrates its time estimates.",
   "author": {
     "name": "shenjingbing"

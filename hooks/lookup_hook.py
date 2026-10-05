@@ -33,6 +33,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+import uuid
 
 PRODUCTIVE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "ApplyPatch"}
 
@@ -112,13 +113,24 @@ DEFAULTS = {
     "drift_cooldown_sec": 900,
     # 教训登记簿:失败循环自动登记坑位,回合开始时注入 Top 教训,防"认坑后再踩"
     "lessons": True,
+    # ── 第三通道:投递请求 + 独立 watcher（v0.7）──
+    # 钩子只写请求单就返回（不阻塞），常驻 watcher 用自己的 key 去审，结论回投后
+    # 由下一次钩子事件捎带注入。主 agent 全程不在链路上 → 独立性最强。
+    # 默认关闭：它花用户自己的 API 额度，只在升级阶梯末档触发。
+    # 契约见 hooks/REVIEW_CHANNEL.md。
+    "deliver_review": False,
+    "escalate_after_reminders": 3,
+    "request_poll_sec": 2,
+    "request_ttl_sec": 900,
+    "result_ttl_sec": 900,
+    "result_settle_calls": 60,
 }
 
 for _k, _v in _SPEC.items():
     if _k in DEFAULTS:
         DEFAULTS[_k] = _v
 
-BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review", "edit_foldback", "adaptive", "drift_check", "lessons", "clock_tick_backoff"}
+BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review", "edit_foldback", "adaptive", "drift_check", "lessons", "clock_tick_backoff", "deliver_review"}
 
 REVIEW_SYSTEM = (
     "你是 AI 编码代理的独立行为审查员。主代理看不到你的存在,你只依据给它的任务描述"
@@ -177,6 +189,128 @@ def save_adaptive(stats):
         pass
 
 
+def review_channel_dir():
+    """第三通道投递区。与 watcher 共用同一目录（见 REVIEW_CHANNEL.md）。"""
+    d = os.path.join(state_dir(), "review")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return d
+
+
+def _id_safe(s):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(s))[:160]
+
+
+def deliver_review_request(cfg, state, now, kind, detail):
+    """把一次末档审查投递出去（第三通道）。返回 request_id 或 None。
+
+    只在升级阶梯到 escalate_after_reminders 时才可能被调用（由调用点把关）。
+    幂等：同一 request_id 的请求单若已存在则跳过。
+    """
+    if not cfg.get("deliver_review"):
+        return None
+    if not (cfg.get("llm_api_key") or "").strip():
+        return None
+    sid = state.get("session_id", "default")
+    rid = "%s-%s-%s" % (_id_safe(sid), state.get("tool_calls", 0), kind)
+    path = os.path.join(review_channel_dir(), "req_%s.json" % _id_safe(rid))
+    if os.path.exists(path):
+        return rid  # 已投递，幂等
+    req = {
+        "v": 1,
+        "request_id": rid,
+        "session_id": sid,
+        "kind": kind,
+        "detail": detail,
+        "created_at": now,
+        "tool_calls": state.get("tool_calls", 0),
+        "prompt_resets": state.get("prompt_resets", 0),
+        "goal_snapshot": clip_goal(state.get("last_goal")),
+        "system": REVIEW_SYSTEM,
+        "material": build_review_material(state, cfg, now, kind, detail),
+    }
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(req, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        return None
+    return rid
+
+
+def take_review_results(state, cfg, now):
+    """扫投递区取回结论。返回待注入文本列表（可能为空）。
+
+    三道闸（见 REVIEW_CHANNEL.md）：场景指纹 / 过期 / 步数。
+    不过闸的**只删文件不注入**。
+    """
+    d = review_channel_dir()
+    texts = []
+    try:
+        names = os.listdir(d)
+    except Exception:
+        return texts
+    sid = state.get("session_id", "default")
+    for name in names:
+        if not (name.startswith("res_") and name.endswith(".json")):
+            continue
+        p = os.path.join(d, name)
+        try:
+            with open(p, encoding="utf-8") as f:
+                res = json.load(f)
+        except Exception:
+            _safe_rm(p)
+            continue
+        if not isinstance(res, dict):
+            _safe_rm(p)
+            continue
+        # 不属于本会话的结论不要碰（可能是另一个会话的）
+        if res.get("session_id") and str(res["session_id"]) != str(sid):
+            continue
+        # 闸1: 场景指纹——用户换过指令则结论作废
+        if res.get("prompt_resets", 0) != state.get("prompt_resets", 0):
+            _safe_rm(p)
+            continue
+        # 闸2: 过期
+        if now - float(res.get("finished_at", 0)) > cfg.get("result_ttl_sec", 900):
+            _safe_rm(p)
+            continue
+        # 闸3: 步数——结论对应几十步前的现场，AI 走远了
+        steps_back = state.get("tool_calls", 0) - int(res.get("tool_calls", 0))
+        if steps_back > cfg.get("result_settle_calls", 60):
+            _safe_rm(p)
+            continue
+        if res.get("verdict") == "error":
+            _safe_rm(p)  # 失败不注入，静默丢弃（可观测性靠 watcher.log）
+            continue
+        texts.append(format_review_result(res, max(0, steps_back)))
+        _safe_rm(p)
+    return texts
+
+
+def _safe_rm(path):
+    try:
+        os.remove(path)
+    except Exception:
+        pass
+
+
+def format_review_result(res, steps_back):
+    """把结论格式化成注入文本。必须标注场景，不能只说'N 步前'。"""
+    label = VERDICT_LABEL.get(res.get("verdict", ""), res.get("verdict", ""))
+    lines = [
+        "🎯 【AI 抬头 · 独立审查者】判定: " + label,
+        "该结论基于 %d 步前「%s」的现场。" % (steps_back, (res.get("detail") or "未知触发")[:60]),
+        "漂移表现: " + (res.get("reason") or "(未给出)"),
+        "收束建议: " + (res.get("suggestion") or "(未给出)"),
+        "请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。",
+    ]
+    return "\n".join(lines)
+
+
 def kind_cooldown(cfg, kind, base):
     """按该类提醒的历史有效率调整冷却:无效(<30%)翻倍降噪,有效(>70%)缩短到 3/4。"""
     if not cfg.get("adaptive"):
@@ -199,16 +333,21 @@ def evaluate_pending(state, cfg):
         return
     remaining = []
     changed = False
+    to_settle = []
     for p in pending:
         if state["tool_calls"] - p["calls_at"] < cfg["settle_after_calls"]:
             remaining.append(p)
             continue
-        effective = _is_effective(state, p)
+        to_settle.append(p)
+    if to_settle:
+        # 一次读、一次写:避免循环内重复 load/save(并发下会互相覆盖丢计数)。
         stats = load_adaptive()
-        s = stats.setdefault(p["kind"], {"fired": 0, "effective": 0})
-        s["fired"] = s.get("fired", 0) + 1
-        if effective:
-            s["effective"] = s.get("effective", 0) + 1
+        for p in to_settle:
+            effective = _is_effective(state, p)
+            s = stats.setdefault(p["kind"], {"fired": 0, "effective": 0})
+            s["fired"] = s.get("fired", 0) + 1
+            if effective:
+                s["effective"] = s.get("effective", 0) + 1
         save_adaptive(stats)
         changed = True
     if changed or remaining != pending:
@@ -445,8 +584,131 @@ def save_state(sid, state):
         pass
 
 
+def _pid_alive(pid):
+    """探测 PID 是否存活。Windows 用 OpenProcess；POSIX 用 os.kill(pid, 0)。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            SYNCHRONIZE = 0x00100000
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+            if h:
+                k32.CloseHandle(h)
+                return True
+            return False
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+class state_lock(object):
+    """跨进程文件锁：保护「load → 处理 → save」整段，避免并发钩子互相覆盖状态。
+
+    P2-1：钩子是独立短命进程，多个事件可能并发落到同一 <sid>.json；
+    没有锁时后写的会整体覆盖先写的（实测 20 并发只保住 7~9 次记录）。
+
+    设计要点（避开 Windows 上踩过的坑）：
+      * 锁内容 = `pid:token`，token 为本次获取的随机串。释放时校验 token——
+        只删自己的锁，绝不误删别人重新抢到的锁。
+      * 接管失效锁用 **rename**（原子），不用 os.remove——
+        直接 remove 可能删掉「刚被别人抢到的新锁」，造成双持有者。
+      * 接管判据 = PID 已死 **或** 锁文件更新时间超过 stale_after 秒。
+        单靠 PID 不可靠：Windows 上被杀的进程仍能被 OpenProcess 打开，
+        且 PID 会被快速复用，两种情况都会让「死锁」看起来还活着。
+      * 有界等待：拿不到锁最多等 wait 秒就放行，绝不卡住会话（可用性优先）。
+    """
+
+    STALE_AFTER = 15.0     # 锁文件超过这么久没更新，即可安全接管
+
+    def __init__(self, sid, wait=None):
+        self.path = state_path(sid) + ".lock"
+        if wait is None:
+            try:
+                wait = float(os.environ.get("LOOKUP_LOCK_WAIT", "2.0"))
+            except Exception:
+                wait = 2.0
+        self.wait = wait
+        self.token = "%d:%s" % (os.getpid(), uuid.uuid4().hex)
+        self.acquired = False
+
+    def _holder_token(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                return (f.read() or "").strip()
+        except Exception:
+            return ""
+
+    def _is_stale(self, raw):
+        """锁是否已失效：PID 已死，或文件久未更新（兜住 PID 复用/zombie）。"""
+        try:
+            age = time.time() - os.path.getmtime(self.path)
+        except OSError:
+            return True
+        if age > self.STALE_AFTER:
+            return True
+        pid = 0
+        try:
+            pid = int(raw.split(":", 1)[0] or "0")
+        except Exception:
+            pid = 0
+        return not _pid_alive(pid)
+
+    def __enter__(self):
+        deadline = time.time() + max(0.0, self.wait)
+        while True:
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(fd, self.token.encode("ascii"))
+                os.close(fd)
+                self.acquired = True
+                return self
+            except FileExistsError:
+                raw = self._holder_token()
+                if raw and self._is_stale(raw):
+                    # 原子接管：rename 到本进程专属名，只有一方能成功，
+                    # 且只对「刚才那个失效锁」生效，不会误伤新持有者。
+                    grab = "%s.stale.%d.%s" % (self.path, os.getpid(), uuid.uuid4().hex[:8])
+                    try:
+                        os.rename(self.path, grab)
+                        try:
+                            os.remove(grab)
+                        except OSError:
+                            pass
+                    except OSError:
+                        pass          # 已被别人接管或已释放，下一轮重试
+                    continue
+                if time.time() >= deadline:
+                    return self      # 超时：不阻塞会话，降级为无锁执行
+                time.sleep(0.02)
+            except OSError:
+                return self
+
+    def __exit__(self, *exc):
+        if not self.acquired:
+            return False
+        # 只删自己的锁：token 不匹配说明锁已被接管/重抢，绝不能动别人的。
+        if self._holder_token() == self.token:
+            try:
+                os.remove(self.path)
+            except OSError:
+                pass
+        return False
+
+
 def reset_stretch(state, cfg, now):
-    """开启新的工作时段:重置回合内的节奏计数,保留会话累计。"""
+    """开启新的工作时段:重置回合内的节奏计数,保留会话累计。
+
+    P2-2：`reminders` 也必须在这里清零。原实现只加不减，同一会话累计 12 次后
+    配额永久耗尽——用户开新任务也不再有任何提醒（新任务静默失守）。
+    配额的本意是「单个回合内别刷屏」,不是「整个会话只能用 12 次」。
+    """
     state["started_at"] = now
     state["calls_at_stretch_start"] = state["tool_calls"]
     state["calls_since_reminder"] = 0
@@ -454,6 +716,11 @@ def reset_stretch(state, cfg, now):
     state["fail_streak"] = 0
     state["recent_cmds"] = []
     state["clock_interval"] = 0
+    state["reminders"] = 0
+    # 注意:这里绝不能动 last_reminder_at / last_fail_reminder_at。
+    # 证据窗口(上面清零的那些)已经保证新回合不可能"立刻触发",而把冷却基准
+    # 拉到 now 会给每个新回合装填一个完整的 cooldown_sec 静默窗——回合开头
+    # 5 分钟内的空跑全部漏报(e2e 场景 A 实测)。
 
 
 def extract_cmd(data):
@@ -702,7 +969,14 @@ def call_llm_review(state, cfg, now, kind, detail, system=REVIEW_SYSTEM):
 def finalize_text(state, cfg, now, kind, detail, static_text):
     """提醒发出前的最后一站:llm_review 开启时追加独立审查结论,失败回退静态文案。
     on-track 仅对模糊型触发(no-output/long-run)用短确认;机械证据型忽略判定,
-    保留完整静态清单——连续失败/零产出是既成事实,不能被"仍在正轨"放行。"""
+    保留完整静态清单——连续失败/零产出是既成事实,不能被"仍在正轨"放行。
+
+    另外:升级阶梯到末档且开启 deliver_review 时,投递一次第三通道审查
+    （不在此处等待——watcher 异步审,结论由后续钩子事件捎带注入）。"""
+    # 第三通道投递：末档才投，避免常态消耗用户 API 额度
+    if (cfg.get("deliver_review")
+            and state.get("reminders", 0) >= cfg.get("escalate_after_reminders", 3)):
+        deliver_review_request(cfg, state, now, kind, detail)
     if not cfg.get("llm_review"):
         return static_text
     verdict = call_llm_review(state, cfg, now, kind, detail)
@@ -753,6 +1027,23 @@ def handle_post_use(cfg, data, state, now):
     fail_before = state["fail_streak"]       # 保存清零前的连败数,供 pending 快照
     state["fail_streak"] = 0
 
+    # 第三通道取回：watcher 异步审完的结论在此捎带注入（先于本地触发器）。
+    # 取回要过三道闸（场景指纹/过期/步数），不过闸的静默丢弃——见 REVIEW_CHANNEL.md。
+    # 注意：只注入、**不提前 return**——否则本次调用进不了 recent_log，
+    # 材料会与实际调用序列脱节（tool_calls 已 +1，日志却没有这条）。
+    pending_verdicts = take_review_results(state, cfg, now) if cfg.get("deliver_review") else []
+    carried = "\n".join(pending_verdicts) if pending_verdicts else ""
+
+    def emit(text):
+        """带上前一次捎带的独立审查结论一起输出(有则拼在前)。
+
+        调用点传进来的 text 一律非空;carried 为空时退化为原行为。
+        只能拼一次——carried 在闭包里恒真值,递归实现会无限递归。
+        """
+        if carried:
+            return post_use_output(carried + "\n" + text)
+        return post_use_output(text)
+
     if tool in PRODUCTIVE_TOOLS:
         state["edits"] += 1
         state["edits_since_reminder"] += 1
@@ -793,7 +1084,7 @@ def handle_post_use(cfg, data, state, now):
             fail_at=fail_before,
         )
         if text:
-            return post_use_output(finalize_text(
+            return emit(finalize_text(
                 state, cfg, now, "edit-foldback",
                 "文件内容折返: {p}".format(p=fb_path),
                 text))
@@ -813,7 +1104,7 @@ def handle_post_use(cfg, data, state, now):
                 fail_at=fail_before,
             )
             if text:
-                return post_use_output(finalize_text(
+                return emit(finalize_text(
                     state, cfg, now, "exact-repeat",
                     "原样命令重复 {n} 次: {cmd}".format(n=hit["count"], cmd=hit["raw"][:100]),
                     text))
@@ -833,7 +1124,7 @@ def handle_post_use(cfg, data, state, now):
                 fail_at=fail_before,
             )
             if text:
-                return post_use_output(finalize_text(
+                return emit(finalize_text(
                     state, cfg, now, "repeat-cmds",
                     "相似命令重复 {n} 次: {p}".format(n=hit["count"], p=hit["prefix"]),
                     text))
@@ -853,7 +1144,7 @@ def handle_post_use(cfg, data, state, now):
             fail_at=fail_before,
         )
         if text:
-            return post_use_output(finalize_text(
+            return emit(finalize_text(
                 state, cfg, now, "long-run",
                 "运行 {m:.0f} 分钟零修改".format(m=fmt_minutes(state, now)),
                 text))
@@ -872,7 +1163,7 @@ def handle_post_use(cfg, data, state, now):
             fail_at=fail_before,
         )
         if text:
-            return post_use_output(finalize_text(
+            return emit(finalize_text(
                 state, cfg, now, "no-output",
                 "{c} 次调用零修改".format(c=state["calls_since_reminder"]),
                 text))
@@ -887,7 +1178,7 @@ def handle_post_use(cfg, data, state, now):
                                   system=REVIEW_DRIFT_SYSTEM)
         if verdict and verdict["verdict"] in ("drifting", "stuck"):
             state["reviews"] = state.get("reviews", 0) + 1
-            return post_use_output(
+            return emit(
                 "🎯 【AI 抬头 · 目标漂移巡检】判定: " + DRIFT_LABEL[verdict["verdict"]]
                 + "\n漂移表现: " + (verdict["reason"] or "(未给出)")
                 + "\n收束建议: " + (verdict["suggestion"] or "(未给出)")
@@ -905,7 +1196,11 @@ def handle_post_use(cfg, data, state, now):
                 state["clock_interval"] = min(max(interval * 2, 1), cfg["clock_tick_max_minutes"])
             else:
                 state["clock_interval"] = cfg["clock_tick_minutes"]
-            return post_use_output(clock_text(state, now))
+            return emit(clock_text(state, now))
+    # 无本地触发的普通事件也要把捎带结论送出去:结论文件在 take_review_results
+    # 里已被删除,不在此注入就永远丢失(JS 端 deliver() 无此问题,任何事件都注入)。
+    if carried:
+        return post_use_output(carried)
     return None
 
 
@@ -927,6 +1222,23 @@ def handle_post_fail(cfg, data, state, now):
     state["last_reminder_at"] = now
     state["last_fail_reminder_at"] = now
     state["last_trigger"] = "fail-loop"
+    # ★ F1 修复：fail-loop 曾绕过 fire()，漏了以下 3 项状态维护。补齐以与 fire() 对齐：
+    #   （1）calls_since_reminder 清零——否则 no-output/long-run 的累计基准被污染
+    #   （2）edits_since_reminder 清零——同上
+    #   （3）pending_reminders 登记——否则自适应统计永不累积，fail-loop 冷却恒为基准
+    # 见他审报告 2026-10-06 F1。
+    state["calls_since_reminder"] = 0
+    state["edits_since_reminder"] = 0
+    _fcur = state.get("recent_cmds", [])
+    state.setdefault("pending_reminders", []).append({
+        "kind": "fail-loop",
+        "calls_at": state["tool_calls"],
+        "edits_at": state["edits"],
+        "fail": state["fail_streak"],
+        "fails_at": state.get("total_failures", 0),
+        "norm": _fcur[-1]["n"] if _fcur else "",
+    })
+    state["pending_reminders"] = state["pending_reminders"][-10:]
     text = "\n".join([
         "🔔 【AI 抬头 · 失败循环】你已连续失败 {n} 次。请勿再用同样的方式重试:".format(
             n=state["fail_streak"]),
@@ -1089,21 +1401,24 @@ def main():
     data = read_stdin_json()
     sid = session_id(data, argv)
     now = time.time()
-    state = load_state(sid, now)
 
-    out = None
-    if action == "post-use":
-        out = handle_post_use(cfg, data, state, now)
-    elif action == "post-fail":
-        out = handle_post_fail(cfg, data, state, now)
-    elif action == "prompt":
-        out = handle_prompt(cfg, data, state, now)
-    elif action == "stop":
-        out = handle_stop(cfg, data, state, now)
-    else:
-        return 0
+    # P2-1：整段 load→处理→save 持锁，避免并发钩子互相覆盖状态。
+    with state_lock(sid):
+        state = load_state(sid, now)
 
-    save_state(sid, state)
+        out = None
+        if action == "post-use":
+            out = handle_post_use(cfg, data, state, now)
+        elif action == "post-fail":
+            out = handle_post_fail(cfg, data, state, now)
+        elif action == "prompt":
+            out = handle_prompt(cfg, data, state, now)
+        elif action == "stop":
+            out = handle_stop(cfg, data, state, now)
+        else:
+            return 0
+
+        save_state(sid, state)
     if out:
         sys.stdout.write(json.dumps(out, ensure_ascii=False))
     return 0

@@ -4,14 +4,14 @@
     {
       "name": "ai-look-up",
       "source": ".",
-      "version": "0.6.1",
-      "description": "Detects aimless AI grinding (repeated commands, failure loops, long runs with no output) and injects mid-run self-review nudges plus real local-time anchors via hooks.",
+      "version": "0.7.0",
+      "description": "Detects aimless AI grinding (repeated commands, failure loops, long runs with no output) and injects mid-run self-review nudges plus real local-time anchors via hooks. v0.7 adds an out-of-host review channel: the hook writes a delivery request and an independent watcher process (own API key) returns the verdict.",
       "displayName": "AI Look-Up",
       "displayName_i18n": {
         "zh-CN": "AI 抬头"
       },
       "description_i18n": {
-        "zh-CN": "检测 AI 长时间空跑(重复命令、连续失败、只跑不产出),在运行中途注入自我审查提醒;并定期注入真实本地时间,校准 AI 的时间感。含 /lookup-review、/lookup-status、/lookup-config 三个命令。"
+        "zh-CN": "检测 AI 长时间空跑(重复命令、连续失败、只跑不产出),在运行中途注入自我审查提醒;并定期注入真实本地时间,校准 AI 的时间感。v0.7 增加第三通道:钩子写投递请求,宿主外的独立 watcher(自带 key)异步审查并回注结论,主代理全程不在链路上。含 /lookup-review、/lookup-status、/lookup-config、/lookup-watch 四个命令。"
       },
       "category": "productivity"
     }

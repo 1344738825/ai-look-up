@@ -22,10 +22,11 @@
 
 import { randomUUID, createHash } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
 const PRODUCTIVE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'ApplyPatch']);
 
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -58,6 +59,11 @@ const KEY_MAP = {
   adaptive_tighten_floor_sec: 'adaptiveTightenFloorSec',
   drift_check_calls: 'driftCheckCalls',
   drift_cooldown_sec: 'driftCooldownSec',
+  escalate_after_reminders: 'escalateAfterReminders',
+  request_poll_sec: 'requestPollSec',
+  request_ttl_sec: 'requestTtlSec',
+  result_ttl_sec: 'resultTtlSec',
+  result_settle_calls: 'resultSettleCalls',
 };
 
 function loadSpec() {
@@ -112,6 +118,16 @@ const DEFAULTS = {
   driftCooldownSec: 900,
   // lesson ledger (v0.5): failures register pitfalls, new agents get the top ones
   lessons: true,
+  // ── 第三通道:投递请求 + 独立 watcher（v0.7）──
+  // deliverReview 默认关:它要花用户自己的 API 额度,只有显式开启才投递。
+  deliverReview: false,
+  // watcher 用的自有 key(投递前置条件之一);空则永不投递。
+  llmApiKey: '',
+  escalateAfterReminders: 3,
+  requestPollSec: 2,
+  requestTtlSec: 900,
+  resultTtlSec: 900,
+  resultSettleCalls: 60,
 };
 
 for (const [snake, v] of Object.entries(SPEC)) {
@@ -277,6 +293,7 @@ function freshState() {
   const now = Date.now();
   return {
     startedAt: now, lastEventAt: now,
+    sessionId: 'default',
     toolCalls: 0, byTool: {},
     edits: 0, editsSinceReminder: 0, callsSinceReminder: 0,
     failStreak: 0, totalFailures: 0,
@@ -298,6 +315,12 @@ function resetStretch(state, cfg, now) {
   state.failStreak = 0;
   state.recentCmds = [];
   state.clockInterval = 0;
+  // P2-2：reminders 必须在这里清零，否则同一会话累计 maxReminders 次后
+  // 配额永久耗尽，用户开新任务也再无提醒（新任务静默失守）。
+  state.reminders = 0;
+  // 注意:这里绝不能动 lastReminderAt / lastFailReminderAt——证据窗口已清零,
+  // 新回合本就不可能立刻触发;把冷却基准拉到 now 会给每个新回合装填一个
+  // 完整的 cooldownSec 静默窗,回合开头 5 分钟内的空跑全部漏报。
 }
 
 function repeatHit(state, cfg) {
@@ -530,6 +553,112 @@ function deliver(agent, ctx, text) {
   return false;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 第三通道:投递请求 + 独立 watcher（v0.7）
+// 协议契约见 hooks/REVIEW_CHANNEL.md。钩子只负责「写请求单 / 取回结论」,
+// 调 LLM 由宿主外面的独立 watcher 进程完成——主 agent 全程不在链路上。
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** 投递区目录。与 Python 钩子共用同一布局（同 env 覆盖键,便于测试指向临时目录）。 */
+function channelStateDir() {
+  const base = process.env.LOOKUP_STATE_DIR || join(tmpdir(), 'zcode-ai-look-up');
+  return base;
+}
+
+function reviewDir() {
+  const d = join(channelStateDir(), 'review');
+  try { mkdirSync(d, { recursive: true }); } catch { /* best-effort */ }
+  return d;
+}
+
+/** 文件名安全化:request_id 里可能带路径分隔符或非 ASCII。 */
+const idSafe = (s) => String(s ?? '').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 160);
+
+function safeUnlink(path) {
+  try { rmSync(path, { force: true }); } catch { /* best-effort */ }
+}
+
+/**
+ * 投递一次末档审查。返回 requestId,或 null(未投)。
+ * 幂等:同一 requestId 的请求单已存在则跳过——同一场景重复触发天然去重。
+ */
+function deliverReviewRequest(cfg, st, now, kind, detail) {
+  if (!cfg.deliverReview) return null;
+  if (!String(cfg.llmApiKey ?? '').trim()) return null;
+  const sid = st.sessionId || 'default';
+  const rid = idSafe(sid + '-' + st.toolCalls + '-' + kind);
+  const path = join(reviewDir(), 'req_' + rid + '.json');
+  try {
+    readFileSync(path);          // 已投递过 → 幂等跳过
+    return rid;
+  } catch { /* 不存在才继续 */ }
+  const req = {
+    v: 1,
+    request_id: rid,
+    session_id: sid,
+    kind,
+    detail: detail || '',
+    created_at: now / 1000,      // 秒,与 Python 侧一致
+    tool_calls: st.toolCalls,
+    prompt_resets: st.promptResets,
+    goal_snapshot: clipGoal(st.goal),
+    system: REVIEW_SYSTEM,
+    material: buildReviewMaterial(st, cfg, now, kind, detail),
+  };
+  try {
+    const tmp = path + '.tmp';
+    writeFileSync(tmp, JSON.stringify(req, null, 1), 'utf8');
+    renameSync(tmp, path);       // 原子落盘:watcher 不会读到半截文件
+  } catch {
+    return null;
+  }
+  return rid;
+}
+
+/** 把结论格式化成注入文本。必须标注场景,不能只说"N 步前"。 */
+function formatReviewResult(res, stepsBack) {
+  const label = VERDICT_LABEL[res.verdict] ?? res.verdict ?? '';
+  return [
+    '🎯 【AI 抬头 · 独立审查者】判定: ' + label,
+    '该结论基于 ' + stepsBack + ' 步前「' + ((res.detail || '未知触发') + '').slice(0, 60) + '」的现场。',
+    '漂移表现: ' + (res.reason || '(未给出)'),
+    '收束建议: ' + (res.suggestion || '(未给出)'),
+    '请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。',
+  ].join('\n');
+}
+
+/**
+ * 扫投递区取回结论。返回待注入文本数组(可能为空)。
+ * 三道闸(见 REVIEW_CHANNEL.md):场景指纹 / 过期 / 步数;
+ * 不过闸只删文件不注入(静默作废)。
+ */
+function takeReviewResults(st, cfg, now) {
+  const texts = [];
+  let names;
+  try { names = readdirSync(reviewDir()); } catch { return texts; }
+  const sid = st.sessionId || 'default';
+  for (const name of names) {
+    if (!name.startsWith('res_') || !name.endsWith('.json')) continue;
+    const p = join(reviewDir(), name);
+    let res;
+    try { res = JSON.parse(readFileSync(p, 'utf8')); } catch { safeUnlink(p); continue; }
+    if (!res || typeof res !== 'object') { safeUnlink(p); continue; }
+    // 不属于本会话的结论不要碰(可能是另一个会话的)
+    if (res.session_id && String(res.session_id) !== String(sid)) continue;
+    // 闸1: 场景指纹——用户换过指令则结论作废
+    if ((res.prompt_resets ?? 0) !== (st.promptResets ?? 0)) { safeUnlink(p); continue; }
+    // 闸2: 过期
+    if (now / 1000 - Number(res.finished_at ?? 0) > cfg.resultTtlSec) { safeUnlink(p); continue; }
+    // 闸3: 步数——结论对应几十步前的现场,AI 已走远
+    const stepsBack = st.toolCalls - Number(res.tool_calls ?? 0);
+    if (stepsBack > cfg.resultSettleCalls) { safeUnlink(p); continue; }
+    if (res.verdict === 'error') { safeUnlink(p); continue; }  // 失败不注入,静默丢弃
+    texts.push(formatReviewResult(res, Math.max(0, stepsBack)));
+    safeUnlink(p);
+  }
+  return texts;
+}
+
 /**
  * Independent reviewer on the optional `llm` service. The stream chunk shape
  * (text blocks + terminal finish) follows the shipped auto-review plugin;
@@ -581,6 +710,10 @@ export function apply(ctx, config) {
   const cfg = mergeConfig(config);
   const reviewer = makeReviewer(ctx);
   const state = new Map(); // agent object -> session state
+  // 仅供测试读取会话状态的探测孔：宿主不设 __testState 时完全不暴露。
+  if (ctx && ctx.__testState) {
+    try { ctx.__testState(state); } catch { /* 探测孔失败不影响运行 */ }
+  }
 
   const stateOf = (agent) => {
     let st = state.get(agent);
@@ -598,6 +731,11 @@ export function apply(ctx, config) {
    */
   const deliverOrReview = (agent, st, kind, detail, fallbackText, system = REVIEW_SYSTEM) => {
     const now = Date.now();
+    // 第三通道投递:只在升级阶梯末档(提醒了还不改)才投——把作弊面从
+    // "内容可篡改"压到"行为可跳过",且成本受控(多数会话到不了这一档)。
+    if (st.reminders >= cfg.escalateAfterReminders) {
+      deliverReviewRequest(cfg, st, now, kind, detail);
+    }
     if (cfg.llmReview && reviewer.ready && !st.reviewInFlight) {
       st.reviewInFlight = true;
       const material = buildReviewMaterial(st, cfg, now, kind, detail);
@@ -702,6 +840,13 @@ export function apply(ctx, config) {
       if (now - st.lastEventAt > STALE_AFTER_MS) resetStretch(st, cfg, now);
       st.lastEventAt = now;
 
+      // 第三通道取回:把独立 watcher 的结论捎带注入。
+      // 只取回文本、不 return——否则本次调用不被计数,toolCalls 会与实际脱节。
+      if (cfg.deliverReview) {
+        const verdicts = takeReviewResults(st, cfg, now);
+        if (verdicts.length) deliver(agent, ctx, verdicts.join('\n'));
+      }
+
       const tool = toolNameOf(exec);
       st.toolCalls += 1;
       st.callsSinceReminder += 1;
@@ -745,6 +890,22 @@ export function apply(ctx, config) {
           st.lastReminderAt = now;
           st.lastFailReminderAt = now;
           st.lastTrigger = 'fail-loop';
+          // 与 fire() 保持同构:这条路径绕开了 fire(),下面三项必须手工补齐,
+          // 否则 pendingReminders/自适应统计/静默计数全部漏维护(F1)。
+          st.callsSinceReminder = 0;
+          st.editsSinceReminder = 0;
+          {
+            const cur = st.recentCmds;
+            st.pendingReminders.push({
+              kind: 'fail-loop',
+              callsAt: st.toolCalls,
+              editsAt: st.edits,
+              fail: st.failStreak,
+              failsAt: st.totalFailures ?? 0,
+              norm: cur.length ? cur[cur.length - 1].n : '',
+            });
+            st.pendingReminders = st.pendingReminders.slice(-10);
+          }
           let text = [
             '🔔 【AI 抬头 · 失败循环】你已连续失败 ' + st.failStreak + ' 次。请勿再用同样的方式重试:',
             '1. 完整读取最近一次的错误信息,定位根因(而不是只看表面症状);',

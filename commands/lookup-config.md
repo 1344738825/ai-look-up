@@ -26,7 +26,7 @@ argument-hint: "[要调整的参数=新值, 或留空查看]"
 | `long_run_minutes` | `25` | 会话持续 N 分钟且零修改 → 提醒 |
 | `long_run_min_calls` | `15` | 超长提醒要求的最少调用数 |
 | `cooldown_sec` | `300` | 普通提醒冷却(秒) |
-| `max_reminders` | `12` | 单会话最多提醒次数 |
+| `max_reminders` | `12` | 单个工作回合内最多提醒次数(新用户指令会重置该配额) |
 | `stop_check` | `true` | 结束时若长期零产出,请求一次继续以复盘 |
 | `stop_min_calls` | `40` | 结束审查要求的最低调用数 |
 | `clock_tick` | `true` | 定期注入真实本地时间,校准 AI 时间感 |
@@ -46,6 +46,12 @@ argument-hint: "[要调整的参数=新值, 或留空查看]"
 | `llm_model` | `deepseek-chat` | 审查用模型 |
 | `llm_timeout_sec` | `12` | 审查调用超时(秒),超时回退静态清单 |
 | `review_log_size` | `12` | 审查材料携带的最近调用条数 |
+| `deliver_review` | `false` | 第三通道:末档时投递请求给独立 watcher(花自己的 key,默认关) |
+| `escalate_after_reminders` | `3` | 同一会话提醒累计 N 次后进入末档,才可能投递 |
+| `request_poll_sec` | `2` | watcher 轮询请求单的间隔(秒) |
+| `request_ttl_sec` | `900` | 请求单超过 N 秒未处理 → 写 error 结论再删 |
+| `result_ttl_sec` | `900` | 结论回来超过 N 秒 → 取回时作废 |
+| `result_settle_calls` | `60` | 结论对应位置距今超过 N 步 → 取回时作废 |
 
 **用户指令处理:**
 

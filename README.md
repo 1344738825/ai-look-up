@@ -51,6 +51,10 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 
 **教训登记簿(v0.5)**:失败循环触发时,把失败命令的归一化模式自动登记为"坑位"(按被踩次数排序);每个新 agent / 新回合开始时,把 Top 3 已知坑位注入对话——教训不再依赖对话记忆,上下文压缩也带不走。后续计划:命令执行前按模式匹配账本,命中即拦截(dsh `ctx.tools.guard()` / ZCode `PreToolUse`),把"不再踩"从建议变成硬约束。
 
+**第三通道:投递请求 + 独立 watcher(v0.7)**:前面几种审查都还在"钩子/宿主自己这一侧"完成,主代理理论上仍能影响它。第三通道把审查**整体搬出宿主**:钩子在**升级阶梯末档**(同一会话第 3 次提醒仍未改善)时,只往投递区写一张"请求单"就立刻返回;一个常驻的独立进程(自带 API key)轮询请求单、读材料、调审查者、把结论写回;钩子在下一次事件里捎带注入结论。主代理**全程不在链路上**:它既不知道审查发生过,也没有任何环节能改写提示词、不发起、或丢弃结果。结论回注前过**三道闸**——场景指纹(用户换过指令则作废)、时效(默认 15 分钟)、步数(默认 60 步内),不过闸只删文件不注入,避免用"几十步前对着旧目标"的判定误导当前决策。默认关闭(dsh 端 `deliverReview` / ZCode 端 `deliver_review`),因为它花的是**用户自己的 API 额度**,只有到末档且显式配置了 key 才投递。协议契约见 `hooks/REVIEW_CHANNEL.md`,工作进程为 `hooks/lookup_watcher.py`。
+
+**并发状态安全(v0.7)**:钩子是短命进程,多个会话事件可能**并发**落到同一个状态文件上。原实现是「读-改-写」无保护,20 个并发事件实测只保住 7~9 次记录,其余被整体覆盖丢失。v0.7 在整段「读 → 处理 → 写」外加了一把跨进程文件锁(`state_lock`),并解决了两个平台坑:释放锁时必须**先关闭文件句柄再删除**(Windows 上句柄未关会静默删除失败),接管失效锁用**原子 rename** 而非直接删除(直接删会误删刚被别人抢到的新锁)。锁的获取带**有界等待**(默认 2 秒),拿不到就放行——绝不为了计数精确而卡住会话。
+
 提醒通过 `additionalContext` / `agent.inject()` 注入,内容为结构化的自我审查清单:对照最初目标 → 检查最近 5 次调用是否带来新信息 → 用一句话决定继续 / 换方法 / 汇报。
 
 ## 斜杠命令
@@ -58,6 +62,7 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 - `/lookup-review` —— 手动触发一次完整的「抬头」自我审查(不依赖任何脚本路径)。
 - `/lookup-status` —— 查看插件对当前会话的监控统计与判定。
 - `/lookup-config` —— 查看 / 修改阈值配置。
+- `/lookup-watch` —— 管理第三通道的独立审查 watcher(启动 / 停止 / 查看状态)。
 
 ## 配置
 
@@ -85,9 +90,10 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 | 触发检测(重复/失败/零产出/折返) | ✅ | ✅ |
 | 本地时钟锚点 | ✅ | ✅ |
 | 独立审查者 | 需配 `llm_api_key`(默认关) | 复用会话 `llm` 服务(默认开) |
+| 第三通道(独立 watcher) | ✅ 由 `hooks/lookup_watcher.py` 承担(自带 key,需显式开 `deliver_review`) | ✅ 同一套目录协议,钩子侧投递/取回已实现;watcher 进程复用同一脚本 |
 | 配置键命名 | `snake_case`(`llm_review`) | `camelCase`(`llmReview`) |
 | `llm_api_base` / `llm_model` / `llm_timeout_sec` | ✅ 生效 | ❌ 不读取;审查者模型跟随会话,如需换模型请在会话层设置 |
-| 状态持久化 | 落盘 `%TEMP%/zcode-ai-look-up/` | 进程内存,**宿主重启即丢状态** |
+| 状态持久化 | 落盘 `%TEMP%/zcode-ai-look-up/`(带跨进程锁) | 会话状态在内存,**宿主重启即丢状态**;第三通道的请求/结论仍落同一目录 |
 
 > ⚠️ `llm_api_key` / `llm_api_base` / `llm_model` / `llm_timeout_sec` 只在 ZCode(Python)
 > 端被读取;dsh 用户配置它们不会生效也不会报错。
@@ -99,6 +105,9 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 - **`test/golden_cases.json`** 是双端金标用例(命令归一化签名 + 会话回放触发序列),
   `test/golden_check.py`(Python)与 `test/golden.mjs`(JS)对同一份用例各跑一遍,
   CI 里任一端漂移即红。
+- **`test/channel_check.py`**(第三通道端到端)与 **`test/revert_verify.py`**(反向验证:
+  把每条修复改回缺陷形态,确认对应测试确实变红)是 v0.7 新增的两道自检——后者用来
+  证明防线不是装饰性的。
 - **`adapters/`** 提供其他钩子型宿主(Claude Code / OpenCode / Gemini CLI)的实验性
   适配 shim——适配层只做事件与字段映射,不复制逻辑,详见 `adapters/README.md`。
 
@@ -109,6 +118,14 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 ```bash
 python <插件目录>/hooks/lookup_hook.py status
 python <插件目录>/hooks/lookup_hook.py reset
+```
+
+第三通道的投递区在同一个目录下的 `review/`:`req_*.json` 是待处理请求单,
+`res_*.json` 是待取回结论,`watcher.log` 是 watcher 运行日志。手动查看 watcher:
+
+```bash
+python <插件目录>/hooks/lookup_watcher.py --status
+python <插件目录>/hooks/lookup_watcher.py --stop
 ```
 
 ## 要求与排错

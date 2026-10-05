@@ -47,6 +47,11 @@ const KEY_MAP = {
   adaptive_tighten_floor_sec: 'adaptiveTightenFloorSec',
   drift_check_calls: 'driftCheckCalls',
   drift_cooldown_sec: 'driftCooldownSec',
+  escalate_after_reminders: 'escalateAfterReminders',
+  request_poll_sec: 'requestPollSec',
+  request_ttl_sec: 'requestTtlSec',
+  result_ttl_sec: 'resultTtlSec',
+  result_settle_calls: 'resultSettleCalls',
 };
 
 let fails = 0;
