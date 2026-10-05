@@ -4,6 +4,16 @@
 本脚本对 v0.7 新增的每条防线逐一回退代码，跑对应测试，要求出现 FAIL。
 
 Run: python test/revert_verify.py
+
+平台说明（v0.7.1）：
+  * 个别缺陷形态是 Windows 专属的（如"句柄未关就 os.remove"——POSIX 允许
+    unlink 打开中的文件，注入后在 Linux 上行为与正确实现等价，测试不可能变红）。
+    这类用例标 requires="win32"：在别的平台记 SKIP，单独计数，不混进 PASS，
+    也不算 FAIL（缺陷在限定的平台上依然是缺陷，且 CI 的 windows 矩阵 job 会真跑它）。
+  * 竞态类回退（P2-1）在 I/O 快的平台上可能收敛到无丢失，用 attempts 多试几次，
+    任意一次红即证明。
+  * 任何单条意外都不中止整个套件（否则 CI 上只见 exit 1 不见哪条出的事）。
+  * 所有 print 强制 flush：CI 管道缓冲会吞掉失败现场的输出。
 """
 import os
 import re
@@ -21,7 +31,7 @@ HOOK = os.path.join(ROOT, "hooks", "lookup_hook.py")
 WATCHER = os.path.join(ROOT, "hooks", "lookup_watcher.py")
 INDEX = os.path.join(ROOT, "index.js")
 
-results = []
+results = []          # (label, True/False/None, note)  None = SKIP
 
 
 def read(p):
@@ -38,34 +48,59 @@ def run(cmd, env=None):
     e = dict(os.environ)
     if env:
         e.update(env)
-    p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, env=e)
+    p = subprocess.run(cmd, cwd=ROOT, capture_output=True,
+                       text=True, encoding="utf-8", errors="replace", env=e)
     return p.returncode, p.stdout + p.stderr
 
 
-def verify(label, file, old, new, test_cmd, expect_pass_cmd=None):
+def verify(label, file, old, new, test_cmd, requires=None, attempts=1):
     """把 file 里的 old 换成 new（注入缺陷），跑 test_cmd，要求返回非 0（红）。"""
-    orig = read(file)
-    if old not in orig:
-        results.append((label, False, "找不到待回退片段"))
-        print("FAIL  找不到待回退片段（脚本与实现已漂移，需同步）: %s" % label)
+    if requires and sys.platform != requires:
+        results.append((label, None, "需要平台 %s" % requires))
+        print("SKIP  平台限定（%s 专属缺陷形态，本平台注入后行为等价）: %s"
+              % (requires, label), flush=True)
         return
-    write(file, orig.replace(old, new, 1))
     try:
-        rc, out = run(test_cmd)
-    finally:
-        write(file, orig)                       # 务必还原
-    if rc != 0:
+        orig = read(file)
+        if old not in orig:
+            results.append((label, False, "找不到待回退片段"))
+            print("FAIL  找不到待回退片段（脚本与实现已漂移，需同步）: %s" % label, flush=True)
+            return
+        mutated = orig.replace(old, new, 1)
+        if mutated == orig:      # 防呆:注入必须真的改变文件字节
+            results.append((label, False, "注入未改变文件"))
+            print("FAIL  注入未改变文件字节: %s" % label, flush=True)
+            return
+        red = False
+        out = ""
+        for _ in range(max(1, attempts)):
+            write(file, mutated)
+            try:
+                rc, out = run(test_cmd)
+            finally:
+                write(file, orig)               # 务必还原
+            if rc != 0:
+                red = True
+                break
+    except Exception as e:                       # 单条意外不中止整个套件
+        results.append((label, False, "verify 异常: %r" % e))
+        print("FAIL  verify 自身异常: %s - %r" % (label, e), flush=True)
+        try:
+            write(file, orig)
+        except Exception:
+            pass
+        return
+    if red:
         results.append((label, True, ""))
-        print("PASS  回退后测试变红: %s" % label)
+        print("PASS  回退后测试变红: %s" % label, flush=True)
     else:
         results.append((label, False, out[-600:]))
-        print("FAIL  回退后测试仍绿（防线是装饰性的）: %s" % label)
-        print("---- 输出尾部 ----\n%s\n----------------" % out[-600:])
+        print("FAIL  回退后测试仍绿（防线是装饰性的或本平台竞态未复现）: %s" % label, flush=True)
+        print("---- 输出尾部 ----\n%s\n----------------" % out[-600:], flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 防线 1：F1 —— fail-loop 补齐 3 项状态维护（Python）
-#   回退：删掉 calls/edits 清零与 pending_reminders 登记 → golden F1 断言应红
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
     "F1/Python: fail-loop 漏 pending_reminders 登记",
@@ -91,8 +126,6 @@ verify(
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 防线 2：P2-3 —— evaluate_pending 单次 load/save（Python）
-#   回退：改回循环内 load+save（模拟重复覆盖）→ 需一条能感知覆盖的断言。
-#   这里用并发覆盖探针。
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
     "P2-3/Python: evaluate_pending 循环内 save_adaptive（多余读改写窗口）",
@@ -120,7 +153,7 @@ verify(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 防线 3：第三通道三闸 —— 任删一闸，对应闸测试应红
+# 防线 3：第三通道三闸 + 会话隔离 + 投递开关
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
     "通道闸1（场景指纹）删除",
@@ -170,7 +203,9 @@ verify(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 防线 4：watcher 单例锁 release（Windows 句柄未关就删 → 静默失效）
+# 防线 4：watcher 单例锁 release —— Windows 专属缺陷形态。
+#   "句柄未关就 os.remove"在 POSIX 上不构成缺陷（允许 unlink 打开中的文件），
+#   注入后行为等价、测试不可能变红 → 平台限定，Linux 上 SKIP。
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
     "watcher release_lock: 句柄未关就 os.remove（Windows 静默失效）",
@@ -194,12 +229,11 @@ verify(
     "    except Exception:\n"
     "        pass",
     [PY, os.path.join(HERE, "channel_check.py")],
+    requires="win32",
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 防线 5：JS F1 —— index.js fail-loop 补齐状态维护
-#   回退：删掉 callsSinceReminder/editsSinceReminder 清零 与 pending 登记，
-#   JS 侧用 golden.mjs 的 fail-loop 回放 + 新增断言感知。
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
     "F1/JS: fail-loop 不清零 callsSinceReminder（no-output 被提前误触发）",
@@ -224,7 +258,7 @@ verify(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 防线 6：JS 第三通道投递开关（deliverReview 关 → 不投）
+# 防线 6：JS 第三通道投递开关
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
     "JS 通道：投递不看 deliverReview 开关",
@@ -243,7 +277,8 @@ verify(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 防线 7：P2-1 —— 跨进程状态锁
+# 防线 7：P2-1 —— 跨进程状态锁。竞态复现依赖调度:快的 Linux I/O 可能收敛到
+#   无丢失,3 次尝试任一红即证明;Windows 上稳定复现(20 进程实测丢 13)。
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
     "P2-1/Python: 未持锁执行 load→save（并发覆盖丢状态）",
@@ -251,6 +286,7 @@ verify(
     "    with state_lock(sid):",
     "    if True:  # lock disabled",
     [PY, os.path.join(HERE, "lock_check.py")],
+    attempts=3,
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -278,9 +314,19 @@ verify(
 
 # ═══════════════════════════════════════════════════════════════════════════
 print()
-ok = sum(1 for _, good, _ in results if good)
-print("revert_verify.py: %d/%d 防线在回退后确实变红" % (ok, len(results)))
-if ok != len(results):
-    print("存在装饰性防线，需修正测试或实现。")
+proven = sum(1 for _, good, _ in results if good is True)
+skipped = sum(1 for _, good, _ in results if good is None)
+failed = sum(1 for _, good, _ in results if good is False)
+print("revert_verify.py: %d/%d 防线在回退后确实变红, %d 条平台限定跳过"
+      % (proven, len(results) - skipped, skipped), flush=True)
+if skipped:
+    for label, good, note in results:
+        if good is None:
+            print("  SKIP  %s (%s)" % (label, note), flush=True)
+if failed:
+    for label, good, note in results:
+        if good is False:
+            print("  FAIL  %s (%s)" % (label, note), flush=True)
+    print("存在装饰性防线、脚本漂移或 verify 自身异常，需修正。", flush=True)
     sys.exit(1)
-print("revert_verify.py: ALL DEFENSES PROVEN")
+print("revert_verify.py: ALL DEFENSES PROVEN", flush=True)

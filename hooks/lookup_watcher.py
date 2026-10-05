@@ -168,6 +168,8 @@ def acquire_lock():
     if _pid_alive(holder):
         return False, lock
     log("接管失效锁（原持有者 PID %s 已死）" % holder)
+    # 接管方式 = remove + O_EXCL 重抢（与 state_lock 的 rename 接管不同但安全性等价:
+    # 两个竞争者都删时只有一个成功,重抢时 O_EXCL 保证单赢家,不会出现双持有者）。
     try:
         os.remove(lock)
     except OSError:
