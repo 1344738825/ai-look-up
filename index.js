@@ -341,12 +341,24 @@ function exactRepeatHit(state, cfg) {
   return count >= cfg.repeatCmdCount ? { raw: last, count } : null;
 }
 
-function fire(state, cfg, now, kind, text, cooldownMs, failAt = null) {
+/**
+ * 统一发火口:所有触发器的状态维护都必须走这里,不许各写一份。
+ *
+ * ★ v0.8 收编 fail-loop:此前 JS 侧 fail-loop 绕过本函数、在 880-931 行
+ * 手工复刻了整套状态维护(F1 就是漏抄 3 项)。现在它同 Python 侧一样走本函数。
+ *
+ * @param {number|null} failAt       pending 快照里的连败数(默认取当前 failStreak)
+ * @param {string|null} stampKey     额外要戳的冷却键名(如 'lastFailReminderAt')
+ * @param {string} cooldownKey       冷却以哪个键为准(fail-loop 用独立冷却)
+ */
+function fire(state, cfg, now, kind, text, cooldownMs, failAt = null,
+              stampKey = null, cooldownKey = 'lastReminderAt') {
   if (!cfg.enabled) return null;
   if (state.reminders >= cfg.maxReminders) return null;
-  if (now - state.lastReminderAt < cooldownMs) return null;
+  if (now - (state[cooldownKey] ?? 0) < cooldownMs) return null;
   state.reminders += 1;
   state.lastReminderAt = now;
+  if (stampKey) state[stampKey] = now;
   state.lastTrigger = kind;
   state.callsSinceReminder = 0;
   state.editsSinceReminder = 0;
@@ -856,14 +868,16 @@ export function apply(ctx, config) {
         st.edits += 1;
         st.editsSinceReminder += 1;
         if (cfg.editFoldback) {
-          recordEditHash(st, cfg, exec).then((hit) => {
-            if (!hit || !cfg.enabled) return;
+          recordEditHash(st, cfg, exec).then((res) => {
+            // ★ 注意:res 是 {hit, path} 对象,永远为真值——必须取 .hit,
+            //   否则每次改动都会误判为折返(与 Python 侧 record_edit_hash 返回布尔的语义对齐)。
+            if (!res?.hit || !cfg.enabled) return;
             const nowFb = Date.now();
             const text = fire(st, cfg, nowFb, 'edit-foldback', nudgeText(st, cfg, nowFb,
-              '文件 ' + hit.path + ' 的内容回到了先前见过的状态——改了又改回是典型的原地打转,'
+              '文件 ' + res.path + ' 的内容回到了先前见过的状态——改了又改回是典型的原地打转,'
               + '请确认这条修改路径是否还有意义。'), kindCooldown(cfg, 'edit-foldback', cfg.cooldownSec * 1000));
             if (text) deliverOrReview(agent, st, 'edit-foldback',
-              '文件内容折返: ' + hit.path, text);
+              '文件内容折返: ' + res.path, text);
           }).catch(() => { /* fold-back detection is best-effort */ });
         }
       } else if (tool === 'Bash') {
@@ -883,49 +897,34 @@ export function apply(ctx, config) {
         st.totalFailures += 1;
         st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: false });
         st.recentLog = st.recentLog.slice(-Math.max(cfg.reviewLogFloor, cfg.reviewLogSize));
-        if (st.failStreak >= cfg.failStreakThreshold
-            && now - st.lastFailReminderAt >= kindCooldown(cfg, 'fail-loop', cfg.failCooldownSec * 1000)
-            && st.reminders < cfg.maxReminders && cfg.enabled) {
-          st.reminders += 1;
-          st.lastReminderAt = now;
-          st.lastFailReminderAt = now;
-          st.lastTrigger = 'fail-loop';
-          // 与 fire() 保持同构:这条路径绕开了 fire(),下面三项必须手工补齐,
-          // 否则 pendingReminders/自适应统计/静默计数全部漏维护(F1)。
-          st.callsSinceReminder = 0;
-          st.editsSinceReminder = 0;
-          {
-            const cur = st.recentCmds;
-            st.pendingReminders.push({
-              kind: 'fail-loop',
-              callsAt: st.toolCalls,
-              editsAt: st.edits,
-              fail: st.failStreak,
-              failsAt: st.totalFailures ?? 0,
-              norm: cur.length ? cur[cur.length - 1].n : '',
-            });
-            st.pendingReminders = st.pendingReminders.slice(-10);
-          }
-          let text = [
+        // ★ v0.8:fail-loop 收编进 fire()。门槛(连败阈值)留在这里,
+        //   其余状态维护全部交给 fire()——此前这里是手工复刻(F1 即漏抄)。
+        //   冷却基准 lastFailReminderAt 独立于其它触发器,故 cooldownKey 与 stampKey 都指向它。
+        if (st.failStreak >= cfg.failStreakThreshold) {
+          let text = fire(st, cfg, now, 'fail-loop', [
             '🔔 【AI 抬头 · 失败循环】你已连续失败 ' + st.failStreak + ' 次。请勿再用同样的方式重试:',
             '1. 完整读取最近一次的错误信息,定位根因(而不是只看表面症状);',
             '2. 判断:这是可以修复的问题,还是方法本身不可行?',
             '3. 换方法、修复后再试;若连续两次换方法仍失败,停下来向用户汇报卡点。',
-          ].join('\n');
-          if (st.reminders >= 3) {
-            text += '\n⚠️ 这已是本会话第 ' + (st.reminders + 1) + ' 次提醒。请考虑完全放弃当前路径,直接向用户汇报。';
-          }
-          deliverOrReview(agent, st, 'fail-loop',
-            '连续失败 ' + st.failStreak + ' 次', text);
-          if (cfg.lessons) {
-            const lastFail = [...st.recentLog].reverse().find((e) => !e.ok);
-            if (lastFail) {
-              registerLesson(normCmd(lastFail.brief) || '未知模式',
-                '连续失败 ' + st.failStreak + ' 次后被打断——换方法前请先读错误定位根因,勿重复此方式');
+          ].join('\n'), kindCooldown(cfg, 'fail-loop', cfg.failCooldownSec * 1000),
+          st.failStreak, 'lastFailReminderAt', 'lastFailReminderAt');
+          if (text) {
+            if (st.reminders >= 3) {
+              text += '\n⚠️ 这已是本会话第 ' + (st.reminders + 1) + ' 次提醒。请考虑完全放弃当前路径,直接向用户汇报。';
             }
+            const streak = st.failStreak;
+            deliverOrReview(agent, st, 'fail-loop',
+              '连续失败 ' + streak + ' 次', text);
+            if (cfg.lessons) {
+              const lastFail = [...st.recentLog].reverse().find((e) => !e.ok);
+              if (lastFail) {
+                registerLesson(normCmd(lastFail.brief) || '未知模式',
+                  '连续失败 ' + streak + ' 次后被打断——换方法前请先读错误定位根因,勿重复此方式');
+              }
+            }
+            st.failStreak = 0;
+            return;
           }
-          st.failStreak = 0;
-          return;
         }
       } else {
         st.failStreak = 0;
@@ -1013,4 +1012,10 @@ export function apply(ctx, config) {
 }
 
 /** Test-only internals for golden conformance checks (no runtime consumers). */
-export const __test = { normCmd, rawCmd, defaults: { ...DEFAULTS } };
+export const __test = {
+  normCmd, rawCmd, defaults: { ...DEFAULTS },
+  // 行为级金标探针所需的只读句柄：freshState 造干净状态、kindCooldown 是
+  // adaptive_* 键的唯一执行位、adaptiveStats 是模块级统计（跨会话存活，
+  // 故探针必须能读取/清空，否则用例互相污染）。
+  freshState, kindCooldown, adaptiveStats,
+};

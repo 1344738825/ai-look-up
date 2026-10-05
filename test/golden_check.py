@@ -272,6 +272,442 @@ def probe_d3_turn_start_grinding():
 check("D3 新回合开头 60 秒内的 peek 空跑仍触发(回合冷却回归)",
       probe_d3_turn_start_grinding() is True)
 
+
+# 9) 金标全键行为断言（v0.8）：spec 的每一个键都必须有一条「改它的值 → 真实执行路径
+#    的可观测行为跟着变」的断言。仅校验「键落在 DEFAULTS 里、值一致」（§2）是不够的，
+#    那正是漏掉 review_log_floor「4 处执行位只接了 1 处」的盲区。
+#    断言纪律（WorkBuddy 2026-06-06 复核信 §3.2）：驱动真实入口函数
+#    （handle_post_use / handle_post_fail / handle_prompt / handle_stop / run_loop），
+#    不手工复刻被测逻辑；每条断言必须在一个方向上产生可观测差异，
+#    回退验证时把该键的执行位改坏必须让本断言变红。
+import tempfile as _tempfile
+import shutil as _sh
+import json as _json
+
+# 断言表：key -> (probe，探针调用两次返回 (a, b)，断言 a != b)
+# 每个 probe 只驱动真实入口，不复制任何被测判定逻辑。
+
+
+def _cfg(**over):
+    c = dict(lk.DEFAULTS)
+    c.update({"clock_tick": False, "drift_check": False, "llm_review": False,
+              "adaptive": False, "edit_foldback": False, "deliver_review": False,
+              "cooldown_sec": 0, "fail_cooldown_sec": 0})
+    c.update(over)
+    return c
+
+
+def _drive(cfg, events, sid, step=60.0):
+    """events: [(tool, cmd|None, fail)] -> (state, outputs, last_now)"""
+    st = lk.new_state(sid, 1000.0)
+    now = 1000.0
+    outs = []
+    for tool, cmd, fail in events:
+        now += step
+        data = {"tool_name": tool,
+                "tool_input": ({"command": cmd} if cmd is not None else {"file_path": "f.txt"})}
+        if fail:
+            o = lk.handle_post_fail(cfg, data, st, now)
+        else:
+            o = lk.handle_post_use(cfg, data, st, now)
+        outs.append(str(o) if o else "")
+    return st, outs, now
+
+
+def _count(outs, marker):
+    return sum(1 for o in outs if marker in o)
+
+
+# ── 单键探针（每个返回一个可比较的观测量）────────────────────────────────
+def _p_call_nudge(iv):
+    """阈值 iv 下，恰好 iv 次调用触发、iv-1 次不触发。
+    返回 (iv-1 次是否静默, iv 次是否触发) —— 双向锚定，写死常量必露馅。"""
+    _, outs_lo, _ = _drive(_cfg(call_nudge_interval=iv),
+                           [("Read", None, False)] * (iv - 1), "bnl-%d" % iv)
+    _, outs_hi, _ = _drive(_cfg(call_nudge_interval=iv),
+                           [("Read", None, False)] * iv, "bnh-%d" % iv)
+    return (_count(outs_lo, "没有产生任何文件修改") == 0,
+            _count(outs_hi, "没有产生任何文件修改") > 0)
+
+
+def _p_repeat_min_calls(mc):
+    _, outs, _ = _drive(_cfg(repeat_min_calls=mc, repeat_cmd_count=3, repeat_window=5),
+                        [("Bash", "echo same", False)] * 6, "brm-%d" % mc)
+    return _count(outs, "原样执行")
+
+
+def _p_repeat_cmd_count(cc):
+    _, outs, _ = _drive(_cfg(repeat_min_calls=0, repeat_cmd_count=cc, repeat_window=6),
+                        [("Bash", "echo same", False)] * 6, "brc-%d" % cc)
+    return _count(outs, "原样执行")
+
+
+def _p_repeat_window(win):
+    """窗口 win 只覆盖最近 win 条命令。
+    序列 x c c c：win=2 只见 c c（2<3，不判重复）；win=4 见 x c c c（3≥3，判重复）。
+    因此 win=2 必须静默 —— 窗口被写大（含更多历史）会翻成触发，即露馅。"""
+    _, outs, _ = _drive(_cfg(repeat_min_calls=0, repeat_cmd_count=3, repeat_window=win),
+                        [("Bash", "x", False), ("Bash", "c", False),
+                         ("Bash", "c", False), ("Bash", "c", False)], "brw-%d" % win)
+    return _count(outs, "原样执行")
+
+
+def _p_max_recent_cmds(mx):
+    _, outs, _ = _drive(_cfg(repeat_min_calls=0, repeat_cmd_count=3, repeat_window=5,
+                             max_recent_cmds=mx),
+                        [("Bash", "a", False), ("Bash", "b", False), ("Bash", "c", False),
+                         ("Bash", "c", False), ("Bash", "c", False)], "bmr-%d" % mx)
+    return _count(outs, "原样执行")
+
+
+def _p_fail_streak_threshold(th):
+    """返回首次触发失败循环时的累计失败数（应 == 阈值）。"""
+    cfg = _cfg(fail_streak_threshold=th, max_reminders=99)
+    st = lk.new_state("bfs-%d" % th, 1000.0)
+    now = 1000.0
+    first = None
+    for _ in range(6):
+        now += 1
+        o = lk.handle_post_fail(cfg, {"tool_name": "Bash", "tool_input": {"command": "boom"}}, st, now)
+        if o and "失败循环" in str(o) and first is None:
+            first = st["total_failures"]
+            st["fail_streak"] = 0
+    return first
+
+
+def _p_long_run_minutes(mins):
+    _, outs, _ = _drive(_cfg(long_run_minutes=mins, long_run_min_calls=15),
+                        [("Read", None, False)] * 20, "blrm-%d" % mins)
+    return _count(outs, "还没有任何文件被修改")
+
+
+def _p_long_run_min_calls(mc):
+    _, outs, _ = _drive(_cfg(long_run_minutes=0, long_run_min_calls=mc),
+                        [("Read", None, False)] * 20, "blrc-%d" % mc)
+    return _count(outs, "还没有任何文件被修改")
+
+
+def _p_cooldown_sec(cd):
+    cfg = _cfg(cooldown_sec=cd, repeat_min_calls=0, repeat_cmd_count=2, repeat_window=3)
+    st = lk.new_state("bcd-%d" % cd, 1000.0)
+    now = 1000.0
+    fires = 0
+    for _ in range(2):
+        for _i in range(3):
+            now += 1
+            o = lk.handle_post_use(cfg, {"tool_name": "Bash", "tool_input": {"command": "echo x"}}, st, now)
+            if o and ("原样执行" in str(o) or "重复执行" in str(o)):
+                fires += 1
+                break
+        now += 200
+    return fires
+
+
+def _p_fail_cooldown_sec(fc):
+    cfg = _cfg(fail_cooldown_sec=fc, fail_streak_threshold=1, max_reminders=99)
+    st = lk.new_state("bfc-%d" % fc, 1000.0)
+    now = 1000.0
+    fires = 0
+    for _ in range(2):
+        now += 1
+        o = lk.handle_post_fail(cfg, {"tool_name": "Bash", "tool_input": {"command": "b"}}, st, now)
+        if o and "失败循环" in str(o):
+            fires += 1
+        now += 100
+    return fires
+
+
+def _p_max_reminders(mx):
+    cfg = _cfg(max_reminders=mx, fail_streak_threshold=1, repeat_min_calls=0,
+               repeat_cmd_count=2, repeat_window=3)
+    st = lk.new_state("bmx-%d" % mx, 1000.0)
+    now = 1000.0
+    fires = 0
+    for _ in range(8):
+        now += 1
+        o = lk.handle_post_fail(cfg, {"tool_name": "Bash", "tool_input": {"command": "b"}}, st, now)
+        if o and "失败循环" in str(o):
+            fires += 1
+    return fires
+
+
+def _p_stop_min_calls(mc):
+    cfg = _cfg(stop_min_calls=mc, long_run_minutes=1)
+    st = lk.new_state("bsm-%d" % mc, 1000.0)
+    st["tool_calls"] = 10
+    st["edits"] = 0
+    o = lk.handle_stop(cfg, {}, st, 1000.0 + 400)
+    return 1 if (o and "结束前审查" in _json.dumps(o, ensure_ascii=False)) else 0
+
+
+def _p_clock_tick_minutes(mins, maxmin, backoff=True):
+    cfg = _cfg(clock_tick=True, clock_tick_backoff=backoff, clock_tick_minutes=mins,
+               clock_tick_max_minutes=maxmin)
+    st = lk.new_state("bck-%d-%d" % (mins, maxmin), 1000.0)
+    now = 1000.0
+    fires = 0
+    for _ in range(100):
+        now += 60
+        o = lk.handle_post_use(cfg, {"tool_name": "Read", "tool_input": {"file_path": "f"}}, st, now)
+        if o and "本地时钟" in str(o):
+            fires += 1
+    return fires
+
+
+def _p_foldback_window(win):
+    cfg = _cfg(edit_foldback=True, foldback_window=win)
+    d = _tempfile.mkdtemp(prefix="bfb-")
+    p = os.path.join(d, "f.txt")
+    st = lk.new_state("bfb-%d" % win, 1000.0)
+    now = 1000.0
+    o = None
+    for content in ("A", "B", "A"):
+        open(p, "w").write(content)
+        now += 1
+        o = lk.handle_post_use(cfg, {"tool_name": "Edit", "tool_input": {"file_path": p}}, st, now)
+    _sh.rmtree(d, ignore_errors=True)
+    return 1 if o and "折返" in str(o) else 0
+
+
+def _p_review_log_size(size, floor):
+    """60 次调用后窗口长度 = max(floor, size)。floor=1 时以 size 为准。"""
+    cfg = _cfg(review_log_size=size, review_log_floor=floor)
+    st = lk.new_state("blc-%d-%d" % (size, floor), 1000.0)
+    now = 1000.0
+    for i in range(60):
+        now += 1
+        lk.handle_post_use(cfg, {"tool_name": "Bash", "tool_input": {"command": "c%d" % i}}, st, now)
+    return len(st["recent_log"])
+
+
+def _p_review_log_floor(size, floor):
+    return _p_review_log_size(size, floor)
+
+
+def _p_settle_after_calls(sa):
+    cfg = _cfg(adaptive=True, settle_after_calls=sa, adaptive_warmup=1,
+               repeat_min_calls=0, repeat_cmd_count=2, repeat_window=3)
+    lk.save_adaptive({})
+    st = lk.new_state("bsa-%d" % sa, 1000.0)
+    now = 1000.0
+    for _ in range(4):
+        now += 1
+        lk.handle_post_use(cfg, {"tool_name": "Bash", "tool_input": {"command": "echo hi"}}, st, now)
+    for i in range(sa + 2):
+        now += 1
+        lk.handle_post_use(cfg, {"tool_name": "Read", "tool_input": {"file_path": "x%d" % i}}, st, now)
+    return sum(v.get("fired", 0) for v in lk.load_adaptive().values())
+
+
+def _p_adaptive(adaptive=True, warmup=5, low=0.3, high=0.7, bm=2, bc=4, tm=0.75, tf=60,
+                fired=10, eff=0, cds=100, gap=150):
+    lk.save_adaptive({"repeat-cmds": {"fired": fired, "effective": eff},
+                      "exact-repeat": {"fired": fired, "effective": eff}})
+    cfg = _cfg(adaptive=adaptive, adaptive_warmup=warmup, adaptive_low_rate=low,
+               adaptive_high_rate=high, adaptive_backoff_mult=bm, adaptive_backoff_cap=bc,
+               adaptive_tighten_mult=tm, adaptive_tighten_floor_sec=tf,
+               cooldown_sec=cds, repeat_min_calls=0, repeat_cmd_count=2, repeat_window=3,
+               max_reminders=12, settle_after_calls=10 ** 9)
+    st = lk.new_state("bad-%d" % (abs(hash((adaptive, warmup, low, high, bm, bc, tm, tf,
+                                            fired, eff, cds, gap))) % 1000000), 1000.0)
+    now = 1000.0
+    fires = 0
+    for _ in range(3):
+        for _i in range(3):
+            now += 1
+            o = lk.handle_post_use(cfg, {"tool_name": "Bash", "tool_input": {"command": "echo same"}}, st, now)
+            if o and ("原样执行" in str(o) or "重复执行" in str(o)):
+                fires += 1
+                break
+        now += gap
+    return fires
+
+
+def _p_kind_cooldown(bc=4, tm=0.75, eff=0):
+    """backoff_cap / tighten_mult 的唯一执行位就是 kind_cooldown 本身（无其它消费点）。"""
+    lk.save_adaptive({"x": {"fired": 10, "effective": eff}})
+    cfg = _cfg(adaptive=True, adaptive_warmup=5, adaptive_low_rate=0.3,
+               adaptive_high_rate=0.7, adaptive_backoff_mult=2, adaptive_backoff_cap=bc,
+               adaptive_tighten_mult=tm, adaptive_tighten_floor_sec=60)
+    return lk.kind_cooldown(cfg, "x", 100)
+
+
+def _p_drift_count(dc, cd):
+    cfg = _cfg(drift_check=True, drift_check_calls=dc, drift_cooldown_sec=cd, llm_api_key="d")
+    saved = lk.call_llm_review
+    lk.call_llm_review = lambda *a, **k: None      # 打桩：只数巡检次数，不发网络
+    try:
+        st = lk.new_state("bdr-%d-%d" % (dc, cd), 1000.0)
+        now = 1000.0
+        for i in range(40):
+            now += 1
+            lk.handle_post_use(cfg, {"tool_name": "Read", "tool_input": {"file_path": "z%d" % i}}, st, now)
+        return st.get("drift_checks", 0)
+    finally:
+        lk.call_llm_review = saved
+
+
+def _p_escalate(esc):
+    cfg = _cfg(escalate_after_reminders=esc, deliver_review=True, llm_api_key="d",
+               fail_streak_threshold=1)
+    rd = lk.review_channel_dir()
+    _sh.rmtree(rd, ignore_errors=True)
+    st = lk.new_state("bes-%d" % esc, 1000.0)
+    st["reminders"] = 2
+    lk.handle_post_fail(cfg, {"tool_name": "Bash", "tool_input": {"command": "b"}}, st, 1111.0)
+    try:
+        n = len([f for f in os.listdir(rd) if f.startswith("req_")])
+    except OSError:
+        n = 0
+    _sh.rmtree(rd, ignore_errors=True)
+    return n
+
+
+def _p_request_poll_sec(pv):
+    import time as _t
+    import importlib.util as _iu
+    wspec = _iu.spec_from_file_location("lkw", os.path.join(ROOT, "hooks", "lookup_watcher.py"))
+    W = _iu.module_from_spec(wspec)
+    wspec.loader.exec_module(W)
+    cap = {}
+
+    def fake_sleep(s):
+        cap["poll"] = s
+        raise KeyboardInterrupt
+
+    orig = (W.load_spec, _t.sleep, W.load_cfg)
+    try:
+        W.load_cfg = lambda: {"enabled": True, "llm_api_key": ""}
+        _t.sleep = fake_sleep
+        W.load_spec = lambda: {"request_poll_sec": pv}
+        try:
+            W.run_loop(once=False)
+        except KeyboardInterrupt:
+            pass
+        return cap.get("poll")
+    finally:
+        W.load_spec, _t.sleep, W.load_cfg = orig
+
+
+# 每键一条行为断言，形式为 (探针, 锚定期望, 说明)：
+#   探针()      -> 观测值
+#   期望(观测值) -> 该观测值是否符合"键按文档语义生效"的**正向**预期
+# 用锚定期望而非简单 `lo != hi`：后者在"键被打断成固定常量 12"时仍可能因两档
+# 都改变了而假绿（settle_after_calls 回退验证实测到过），锚定则要求语义方向正确。
+def _nonzero(v):
+    return v is not None and v > 0
+
+
+def _zero(v):
+    return v == 0
+
+
+def _eq(n):
+    return lambda v: v == n
+
+
+BEHAVIOR_KEYS = {
+    # 键: (探针, 期望, 说明)
+    "call_nudge_interval": (lambda: _p_call_nudge(3),
+                            _eq((True, True)), "阈值 3：前 2 次静默、第 3 次触发"),
+    "repeat_min_calls": (lambda: _p_repeat_min_calls(0),
+                         _nonzero, "静默下限为 0 时重复命令立即被判重复"),
+    "repeat_cmd_count": (lambda: _p_repeat_cmd_count(2),
+                         _nonzero, "阈值 2 时 6 次同命令必判重复"),
+    "repeat_window": (lambda: _p_repeat_window(2),
+                      _eq(0), "窗口 2 只见 c c（<3）→ 不判重复"),
+    "max_recent_cmds": (lambda: _p_max_recent_cmds(8),
+                        _nonzero, "缓冲 8 保留 a,b,c,c,c → 判重复"),
+    "fail_streak_threshold": (lambda: _p_fail_streak_threshold(3),
+                              _eq(3), "首次触发失败循环恰在累计失败=阈值(3)"),
+    "long_run_minutes": (lambda: _p_long_run_minutes(0),
+                         _nonzero, "时间下限 0 → 立即判长跑零修改"),
+    "long_run_min_calls": (lambda: _p_long_run_min_calls(0),
+                           _nonzero, "调用下限 0 → 立即判长跑零修改"),
+    "cooldown_sec": (lambda: _p_cooldown_sec(0),
+                     _eq(2), "冷却 0 → 两轮重复都触发"),
+    "fail_cooldown_sec": (lambda: _p_fail_cooldown_sec(0),
+                          _eq(2), "失败冷却 0 → 两轮失败都触发"),
+    "max_reminders": (lambda: _p_max_reminders(2),
+                      _eq(2), "配额 2 → 至多 2 次提醒"),
+    "stop_min_calls": (lambda: _p_stop_min_calls(5),
+                       _eq(1), "下限 5(calls=10) → 触发结束前审查"),
+    "clock_tick_minutes": (lambda: _p_clock_tick_minutes(60, 60),
+                           _nonzero, "间隔 60 分钟 → 长跑中触发时钟锚点"),
+    "clock_tick_max_minutes": (lambda: _p_clock_tick_minutes(1, 6, True),
+                               _eq(18), "基础 1 分钟/上限 6 → 100 分钟内退避到 6 后恒 6"),
+    "foldback_window": (lambda: _p_foldback_window(5),
+                        _eq(1), "窗口 5 → A→B→A 折返被识别"),
+    "review_log_size": (lambda: _p_review_log_size(5, 1),
+                        _eq(5), "floor=1 时窗口以 size(5) 为准"),
+    "review_log_floor": (lambda: _p_review_log_floor(12, 40),
+                         _eq(40), "地板 40 压过 size(12) → 保留 40 条"),
+    "settle_after_calls": (lambda: _p_settle_after_calls(1),
+                           _nonzero, "结算步数 1 → 提醒被立即结算计入统计"),
+    "adaptive_warmup": (lambda: _p_adaptive(warmup=5),
+                        _eq(2), "预热 5(样本10) → backoff 生效(续火次数减少)"),
+    "adaptive_low_rate": (lambda: _p_adaptive(low=0.3, eff=2),
+                          _eq(2), "低门槛 0.3 > 有效率 0.2 → 触发降噪"),
+    "adaptive_high_rate": (lambda: (_p_adaptive(high=0.7, eff=8, gap=85),
+                                    _p_adaptive(high=0.9, eff=8, gap=85)),
+                           _eq((3, 2)), "有效率 0.8：门槛 0.7 → 收紧(续火3)；门槛 0.9 → 不收窄(续火2)"),
+    "adaptive_backoff_mult": (lambda: _p_adaptive(bm=2),
+                              _eq(2), "倍率 2 → 冷却 200 压住间隔 150"),
+    "adaptive_backoff_cap": (lambda: _p_kind_cooldown(bc=4),
+                             _eq(200), "倍率2×基础100=200，未触上限 400"),
+    "adaptive_tighten_mult": (lambda: _p_kind_cooldown(tm=0.75, eff=10),
+                              _eq(75.0), "收紧倍率 0.75×基础100=75"),
+    "adaptive_tighten_floor_sec": (lambda: _p_adaptive(eff=10, tf=60),
+                                   _eq(3), "地板 60 低于 100 → 收紧后仍能续火"),
+    "drift_check_calls": (lambda: _p_drift_count(5, 0),
+                          _eq(7), "间隔 5，40 次调用 → 巡检 7 次"),
+    "drift_cooldown_sec": (lambda: _p_drift_count(5, 0),
+                           _nonzero, "冷却 0 → 巡检多次发生"),
+    "escalate_after_reminders": (lambda: _p_escalate(3),
+                                 _eq(1), "门槛 3(reminders 到 3) → 投递 1 件请求"),
+    "request_poll_sec": (lambda: _p_request_poll_sec(7),
+                         _eq(7), "spec 轮询 7s → run_loop 睡 7s"),
+}
+
+# 这些键的行为断言由 test/channel_check.py 覆盖（第三通道端到端），
+# 此处只登记"已被覆盖"，避免重复又漏记。
+CHANNEL_COVERED = {"request_ttl_sec", "result_ttl_sec", "result_settle_calls"}
+
+NUMERIC_KEYS = [k for k in SPEC if k not in ("interpreters", "script_extensions")]
+covered = set(BEHAVIOR_KEYS) | CHANNEL_COVERED
+missing = [k for k in NUMERIC_KEYS if k not in covered]
+check("全键行为断言覆盖 spec 每个标量键", not missing,
+      "未覆盖: %r" % missing)
+
+for _k in NUMERIC_KEYS:
+    if _k in BEHAVIOR_KEYS:
+        _probe, _expect, _desc = BEHAVIOR_KEYS[_k]
+        try:
+            _got = _probe()
+            _ok = bool(_expect(_got))
+            check("behavior %s（%s）" % (_k, _desc), _ok,
+                  "观测值 %r 不符合文档语义（键未真正接入执行路径或被写死）" % (_got,))
+        except Exception as _e:  # noqa: BLE001
+            check("behavior %s" % _k, False, "探针异常: %r" % _e)
+    else:
+        # 第三通道键：此处确认它们确实被 channel_check 覆盖（文件存在即视为登记）
+        check("behavior %s（由 channel_check.py 端到端覆盖）" % _k,
+              os.path.exists(os.path.join(HERE, "channel_check.py")))
+
+# 列表键（interpreters / script_extensions）的行为断言在 §2 的 norm_cmd 金标里，
+# 用同一份 spec 推导：删掉一个解释器/扩展名，norm_cmd 输出必变。
+# 注意：归一化要求「解释器集合命中」且「脚本扩展名命中」两者同时成立，
+# 故探测用解释器 × 已知扩展名的交叉组合（powershell 只在 spec 里、.ps1 也是）。
+check("behavior interpreters（norm_cmd 行为随 spec 解释器集合变）",
+      lk.norm_cmd("python a1.py") == "python a.py"
+      and lk.norm_cmd("pwsh a1.ps1") == "pwsh a.ps1"
+      and lk.norm_cmd("unknownbin a1.py") == "unknownbin a1.py")
+check("behavior script_extensions（norm_cmd 行为随 spec 扩展名集合变）",
+      lk.norm_cmd("python a1.ps1") == "python a.ps1"
+      and lk.norm_cmd("python a1.mjs") == "python a.mjs"
+      and lk.norm_cmd("python a1.noext") == "python a1.noext")
+
+
 print()
 print("golden_check.py: %s" % ("ALL PASSED" if fails == 0 else "%d FAILURES" % fails))
 sys.exit(0 if fails == 0 else 1)

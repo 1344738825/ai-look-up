@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 import uuid
@@ -619,13 +620,20 @@ class state_lock(object):
         只删自己的锁，绝不误删别人重新抢到的锁。
       * 接管失效锁用 **rename**（原子），不用 os.remove——
         直接 remove 可能删掉「刚被别人抢到的新锁」，造成双持有者。
-      * 接管判据 = PID 已死 **或** 锁文件更新时间超过 stale_after 秒。
-        单靠 PID 不可靠：Windows 上被杀的进程仍能被 OpenProcess 打开，
-        且 PID 会被快速复用，两种情况都会让「死锁」看起来还活着。
+      * 接管判据 = PID 已死 **或** 锁文件心跳超过 stale_after 秒（见下）。
       * 有界等待：拿不到锁最多等 wait 秒就放行，绝不卡住会话（可用性优先）。
+
+    ★ v0.8 心跳：以前接管只看「文件 mtime 是否过期」，可 mtime 只有创建时被写一次，
+    于是它实际等于"锁创建了多久"而非"持锁者还活着多久"。两个后果：
+      - **POSIX 上 `os.kill(pid, 0)` 对 zombie 进程返回成功** → `_pid_alive` 判活，
+        僵尸锁无人接管（要等 STALE_AFTER 兜底）；
+      - 反之若临界区真比 STALE_AFTER 长（大状态文件 + 慢盘），活锁会被误接管 → 双持有者。
+    现在持锁者起一个心跳线程定期 touch mtime，`STALE_AFTER` 才真正表示
+    "持锁者最近一次动静在 N 秒前"，两个方向都准。
     """
 
-    STALE_AFTER = 15.0     # 锁文件超过这么久没更新，即可安全接管
+    STALE_AFTER = 15.0     # 心跳超过这么久没更新，即可安全接管
+    HEARTBEAT_SEC = 5.0    # 心跳间隔（须显著小于 STALE_AFTER，留冗余）
 
     def __init__(self, sid, wait=None):
         self.path = state_path(sid) + ".lock"
@@ -637,6 +645,8 @@ class state_lock(object):
         self.wait = wait
         self.token = "%d:%s" % (os.getpid(), uuid.uuid4().hex)
         self.acquired = False
+        self._hb_stop = threading.Event()
+        self._hb_thread = None
 
     def _holder_token(self):
         try:
@@ -645,8 +655,40 @@ class state_lock(object):
         except Exception:
             return ""
 
+    def heartbeat(self):
+        """刷新锁文件 mtime，告诉等待者"我还活着"。只在自己仍持有锁时刷。"""
+        if not self.acquired:
+            return
+        # 只在 token 仍属自己时 touch，避免给"已被接管的新锁"续命。
+        if self._holder_token() != self.token:
+            self._hb_stop.set()
+            return
+        try:
+            os.utime(self.path, None)
+        except OSError:
+            pass
+
+    def _start_heartbeat(self):
+        def _loop():
+            # wait(x) 在 stop 被 set 时立即返回，因此这里天然随 __exit__ 退出。
+            while not self._hb_stop.wait(self.HEARTBEAT_SEC):
+                self.heartbeat()
+        t = threading.Thread(target=_loop, name="state-lock-hb", daemon=True)
+        t.start()
+        self._hb_thread = t
+
+    def _stop_heartbeat(self):
+        self._hb_stop.set()
+        t = self._hb_thread
+        if t is not None:
+            try:
+                t.join(timeout=1.0)
+            except Exception:
+                pass
+            self._hb_thread = None
+
     def _is_stale(self, raw):
-        """锁是否已失效：PID 已死，或文件久未更新（兜住 PID 复用/zombie）。"""
+        """锁是否已失效：PID 已死，或心跳久未更新（兜住 PID 复用/zombie）。"""
         try:
             age = time.time() - os.path.getmtime(self.path)
         except OSError:
@@ -668,6 +710,7 @@ class state_lock(object):
                 os.write(fd, self.token.encode("ascii"))
                 os.close(fd)
                 self.acquired = True
+                self._start_heartbeat()      # ★ v0.8：持锁期间持续刷 mtime
                 return self
             except FileExistsError:
                 raw = self._holder_token()
@@ -693,6 +736,7 @@ class state_lock(object):
     def __exit__(self, *exc):
         if not self.acquired:
             return False
+        self._stop_heartbeat()               # ★ v0.8：先停心跳，再删锁
         # 只删自己的锁：token 不匹配说明锁已被接管/重抢，绝不能动别人的。
         if self._holder_token() == self.token:
             try:
@@ -807,15 +851,34 @@ def fmt_minutes(state, now):
     return max(0.0, (now - state.get("started_at", now)) / 60.0)
 
 
-def fire(state, cfg, now, kind, text, cooldown, fail_at=None):
+def fire(state, cfg, now, kind, text, cooldown, fail_at=None, stamp_key=None,
+         cooldown_key="last_reminder_at"):
+    """统一发火口:所有触发器的状态维护都必须走这里,不许各写一份。
+
+    参数:
+      fail_at      —— pending 快照里的连败数。默认取当前 fail_streak;
+                      但 no-output/long-run 等在 handle_post_use 里调用时,
+                      fail_streak 已被提前清零,须由调用方传入清零前的值。
+      stamp_key    —— 除 last_reminder_at 外,额外要戳的冷却键名(如 fail-loop
+                      的 "last_fail_reminder_at")。为 None 则不额外戳。
+      cooldown_key —— 冷却以哪个键为准。fail-loop 用独立冷却,故传
+                      "last_fail_reminder_at";其余默认共用 last_reminder_at。
+
+    ★ v0.8 收编 fail-loop:此前 handle_post_fail 绕过本函数、手工复刻了
+    下面全部 7 项状态维护。那种写法让"新增一个触发器"必须再抄一份,
+    且 F1 缺陷(漏抄 3 项)正是这么来的。现在 fail-loop 也走本函数,
+    Python 侧不再有任何手工路径。
+    """
     if not cfg["enabled"]:
         return None
     if state["reminders"] >= cfg["max_reminders"]:
         return None
-    if now - state.get("last_reminder_at", 0.0) < cooldown:
+    if now - state.get(cooldown_key, 0.0) < cooldown:
         return None
     state["reminders"] += 1
     state["last_reminder_at"] = now
+    if stamp_key:
+        state[stamp_key] = now
     state["last_trigger"] = kind
     state["calls_since_reminder"] = 0
     state["edits_since_reminder"] = 0
@@ -1214,38 +1277,25 @@ def handle_post_fail(cfg, data, state, now):
     state["recent_log"] = log[-max(cfg["review_log_floor"], cfg["review_log_size"]):]
     if state["fail_streak"] < cfg["fail_streak_threshold"]:
         return None
-    if now - state.get("last_fail_reminder_at", 0.0) < kind_cooldown(cfg, "fail-loop", cfg["fail_cooldown_sec"]):
+    # ★ v0.8:fail-loop 收编进 fire()。此前这里是手工复刻的整套状态维护,
+    #   漏抄了 3 项(F1)。现在前置门槛(连败阈值)留在这里,其余全部交给 fire()。
+    #   冷却基准用 last_fail_reminder_at(独立于其它触发器),故 cooldown_key
+    #   与 stamp_key 都指向它。
+    text = fire(
+        state, cfg, now, "fail-loop",
+        "\n".join([
+            "🔔 【AI 抬头 · 失败循环】你已连续失败 {n} 次。请勿再用同样的方式重试:".format(
+                n=state["fail_streak"]),
+            "1. 完整读取最近一次的错误信息,定位根因(而不是只看表面症状);",
+            "2. 判断:这是可以修复的问题,还是方法本身不可行?",
+            "3. 换方法、修复后再试;若连续两次换方法仍失败,停下来向用户汇报卡点。",
+        ]),
+        kind_cooldown(cfg, "fail-loop", cfg["fail_cooldown_sec"]),
+        stamp_key="last_fail_reminder_at",
+        cooldown_key="last_fail_reminder_at",
+    )
+    if not text:
         return None
-    if state["reminders"] >= cfg["max_reminders"] or not cfg["enabled"]:
-        return None
-    state["reminders"] += 1
-    state["last_reminder_at"] = now
-    state["last_fail_reminder_at"] = now
-    state["last_trigger"] = "fail-loop"
-    # ★ F1 修复：fail-loop 曾绕过 fire()，漏了以下 3 项状态维护。补齐以与 fire() 对齐：
-    #   （1）calls_since_reminder 清零——否则 no-output/long-run 的累计基准被污染
-    #   （2）edits_since_reminder 清零——同上
-    #   （3）pending_reminders 登记——否则自适应统计永不累积，fail-loop 冷却恒为基准
-    # 见他审报告 2026-10-06 F1。
-    state["calls_since_reminder"] = 0
-    state["edits_since_reminder"] = 0
-    _fcur = state.get("recent_cmds", [])
-    state.setdefault("pending_reminders", []).append({
-        "kind": "fail-loop",
-        "calls_at": state["tool_calls"],
-        "edits_at": state["edits"],
-        "fail": state["fail_streak"],
-        "fails_at": state.get("total_failures", 0),
-        "norm": _fcur[-1]["n"] if _fcur else "",
-    })
-    state["pending_reminders"] = state["pending_reminders"][-10:]
-    text = "\n".join([
-        "🔔 【AI 抬头 · 失败循环】你已连续失败 {n} 次。请勿再用同样的方式重试:".format(
-            n=state["fail_streak"]),
-        "1. 完整读取最近一次的错误信息,定位根因(而不是只看表面症状);",
-        "2. 判断:这是可以修复的问题,还是方法本身不可行?",
-        "3. 换方法、修复后再试;若连续两次换方法仍失败,停下来向用户汇报卡点。",
-    ])
     if state.get("reminders", 0) >= 3:
         text += "\n⚠️ 这已是本会话第 {n} 次提醒。请考虑完全放弃当前路径,直接向用户汇报。".format(
             n=state["reminders"] + 1)

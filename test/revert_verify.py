@@ -100,27 +100,31 @@ def verify(label, file, old, new, test_cmd, requires=None, attempts=1):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 防线 1：F1 —— fail-loop 补齐 3 项状态维护（Python）
+# 防线 1：F1 —— fail-loop 的状态维护必须由 fire() 统一提供（Python）
+#   v0.8 收编后，fail-loop 不再有手工路径，维护点全部落在 fire() 内。
+#   回退：删掉 fire() 里的对应项 → golden F1 断言应红。
+#   （同理也守住"新触发器若绕过 fire() 自行维护"这一整类病：
+#     只要 fire() 被削，所有走它的触发器一起受害，测试必红。）
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
-    "F1/Python: fail-loop 漏 pending_reminders 登记",
+    "F1/Python: fire() 漏 pending_reminders 登记",
     HOOK,
-    '    state["calls_since_reminder"] = 0\n'
-    '    state["edits_since_reminder"] = 0\n'
-    '    _fcur = state.get("recent_cmds", [])\n'
-    '    state.setdefault("pending_reminders", []).append({',
-    '    _fcur = state.get("recent_cmds", [])\n'
-    '    state.setdefault("pending_reminders", []).append({',
+    '    cur = state.get("recent_cmds", [])\n'
+    '    pending = state.setdefault("pending_reminders", [])\n'
+    '    pending.append({',
+    '    cur = state.get("recent_cmds", [])\n'
+    '    pending = state.setdefault("pending_reminders", [])\n'
+    '    if False: pending.append({',
     [PY, os.path.join(HERE, "golden_check.py")],
 )
 
 verify(
-    "F1/Python: fail-loop 不清零 calls_since_reminder（no-output 被提前误触发）",
+    "F1/Python: fire() 不清零 calls_since_reminder（no-output 被提前误触发）",
     HOOK,
+    '    state["last_trigger"] = kind\n'
     '    state["calls_since_reminder"] = 0\n'
-    '    state["edits_since_reminder"] = 0\n'
-    '    _fcur = state.get("recent_cmds", [])',
-    '    _fcur = state.get("recent_cmds", [])',
+    '    state["edits_since_reminder"] = 0\n',
+    '    state["last_trigger"] = kind\n',
     [PY, os.path.join(HERE, "golden_check.py")],
 )
 
@@ -233,27 +237,26 @@ verify(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 防线 5：JS F1 —— index.js fail-loop 补齐状态维护
+# 防线 5：JS F1 —— fire() 统一提供状态维护（v0.8 收编后 fail-loop 无手工路径）
+#   回退：削 fire() 里的对应项，JS 侧用 dsh-smoke 的 fail-loop 回放感知。
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
-    "F1/JS: fail-loop 不清零 callsSinceReminder（no-output 被提前误触发）",
+    "F1/JS: fire() 不清零 callsSinceReminder（no-output 被提前误触发）",
     INDEX,
-    "          st.callsSinceReminder = 0;\n"
-    "          st.editsSinceReminder = 0;\n"
-    "          {\n"
-    "            const cur = st.recentCmds;",
-    "          {\n"
-    "            const cur = st.recentCmds;",
+    "  state.lastTrigger = kind;\n"
+    "  state.callsSinceReminder = 0;\n"
+    "  state.editsSinceReminder = 0;\n",
+    "  state.lastTrigger = kind;\n",
     [NODE, os.path.join(HERE, "dsh-smoke.mjs")],
 )
 
 verify(
-    "F1/JS: fail-loop 漏 pendingReminders 登记（自适应统计被架空）",
+    "F1/JS: fire() 漏 pendingReminders 登记（自适应统计被架空）",
     INDEX,
-    "            st.pendingReminders.push({\n"
-    "              kind: 'fail-loop',",
-    "            if (false) st.pendingReminders.push({\n"
-    "              kind: 'fail-loop',",
+    "  state.pendingReminders.push({\n"
+    "    kind,\n",
+    "  if (false) state.pendingReminders.push({\n"
+    "    kind,\n",
     [NODE, os.path.join(HERE, "dsh-smoke.mjs")],
 )
 
@@ -290,6 +293,19 @@ verify(
 )
 
 # ═══════════════════════════════════════════════════════════════════════════
+# 防线 7b：v0.8 心跳 —— 持锁者临界区超过 STALE_AFTER 时活锁不得被误接管。
+#   回退：删掉 __enter__ 里的 _start_heartbeat() → lock_check 的心跳探针必红。
+#   跨平台：心跳是语义层防线，不依赖 POSIX/Windows 差异，两端一致有效。
+# ═══════════════════════════════════════════════════════════════════════════
+verify(
+    "v0.8 心跳：删掉 _start_heartbeat() 后活锁被误接管",
+    HOOK,
+    "                self._start_heartbeat()      # ★ v0.8：持锁期间持续刷 mtime\n",
+    "",
+    [PY, os.path.join(HERE, "lock_check.py")],
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
 # 防线 8：P2-2 —— 新回合重置 reminders 配额
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
@@ -310,6 +326,34 @@ verify(
     "  state.reminders = 0;",
     "  // P2-2 disabled for revert-verify",
     [NODE, os.path.join(HERE, "dsh-smoke.mjs")],
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 防线 9：v0.8 新发现 —— JS fold-back 的 hit 真值判定。
+#   recordEditHash 返回 {hit, path} 对象（永远为真值），调用方必须取 .hit。
+#   回退成 `if (!res || ...)` 后每次 Edit/Write 都会被误判为折返
+#   → golden.mjs 的 foldbackWindow 两面断言（window=1 应为 0 次）必红。
+# ═══════════════════════════════════════════════════════════════════════════
+verify(
+    "v0.8/JS: fold-back 用对象真值判定（每次改动都误判折返）",
+    INDEX,
+    "            if (!res?.hit || !cfg.enabled) return;",
+    "            if (!res || !cfg.enabled) return;",
+    [NODE, os.path.join(HERE, "golden.mjs")],
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 防线 10：v0.8 收编 —— fail-loop 必须经 fire()（Python 侧同族守卫）。
+#   回退：把 handle_post_fail 里的 fire() 调用改回手工复刻的地板逻辑形态，
+#   削掉 fail-loop 的状态维护 → golden 的 F1/fail-loop 断言必红。
+#   （用"把 fire 调用改成不落任何状态"的等价回退来模拟手工路径漏项。）
+# ═══════════════════════════════════════════════════════════════════════════
+verify(
+    "v0.8/Python: fail-loop 不经 fire()（状态维护缺失）",
+    HOOK,
+    '    text = fire(\n        state, cfg, now, "fail-loop",',
+    '    text = fire(\n        state, cfg, now, "__fail_loop_disabled__",',
+    [PY, os.path.join(HERE, "golden_check.py")],
 )
 
 # ═══════════════════════════════════════════════════════════════════════════

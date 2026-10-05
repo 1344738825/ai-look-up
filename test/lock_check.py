@@ -54,6 +54,57 @@ def run_concurrent():
     return st.get("tool_calls", 0), d
 
 
+def probe_heartbeat():
+    """v0.8 心跳：持锁者临界区超过 STALE_AFTER 时，活锁不得被等待者误接管。
+
+    回退验证：把 state_lock.__enter__ 里的 self._start_heartbeat() 删掉，
+    本探针必须变红（B 会抢到锁）。
+    """
+    import threading
+    import time
+    import shutil as _sh
+    if os.path.join(ROOT, "hooks") not in sys.path:
+        sys.path.insert(0, os.path.join(ROOT, "hooks"))
+    # 探针用自己的临时目录，避免污染主状态。
+    # 注意：state_path() 在调用时才读 LOOKUP_STATE_DIR，故隔离须覆盖整个探针期。
+    _d = tempfile.mkdtemp(prefix="lookup-hb-")
+    _old_state = os.environ.get("LOOKUP_STATE_DIR")
+    os.environ["LOOKUP_STATE_DIR"] = _d
+    import lookup_hook as H
+    old_stale, old_hb = H.state_lock.STALE_AFTER, H.state_lock.HEARTBEAT_SEC
+    H.state_lock.STALE_AFTER = 2.0      # 收紧便于测试
+    H.state_lock.HEARTBEAT_SEC = 0.3
+    try:
+        sid = "hbprobe"
+        held = {}
+        mtime_ok = {}
+
+        def holder():
+            with H.state_lock(sid, wait=0):
+                p = H.state_path(sid) + ".lock"
+                m1 = os.path.getmtime(p)
+                time.sleep(1.0)
+                m2 = os.path.getmtime(p)
+                mtime_ok["advanced"] = m2 > m1        # 心跳应推进 mtime
+                time.sleep(2.6)                       # 总持锁 > STALE_AFTER
+                held["done"] = True
+
+        th = threading.Thread(target=holder)
+        th.start()
+        time.sleep(0.5)                               # 等持锁者拿到锁并起心跳
+        with H.state_lock(sid, wait=1.0) as lk:
+            got_b = lk.acquired
+        th.join()
+        return mtime_ok.get("advanced", False), got_b
+    finally:
+        H.state_lock.STALE_AFTER, H.state_lock.HEARTBEAT_SEC = old_stale, old_hb
+        if _old_state is None:
+            os.environ.pop("LOOKUP_STATE_DIR", None)
+        else:
+            os.environ["LOOKUP_STATE_DIR"] = _old_state
+        _sh.rmtree(_d, ignore_errors=True)
+
+
 def main():
     if os.environ.get("LOOKUP_STATE_DIR"):
         print("SKIP（已在外层指定 LOOKUP_STATE_DIR）")
@@ -66,11 +117,22 @@ def main():
     shutil.rmtree(d1, ignore_errors=True)
     lost_locked = N - calls_locked
     print("并发 %d，最终 tool_calls=%d，丢 %d" % (N, calls_locked, lost_locked))
+    ok = True
     if lost_locked == 0:
         print("PASS  lock_check.py: 跨进程锁保证并发事件零丢失")
-        return 0
-    print("FAIL  lock_check.py: 丢 %d 次，锁未起作用或被绕过" % lost_locked)
-    return 1
+    else:
+        print("FAIL  lock_check.py: 丢 %d 次，锁未起作用或被绕过" % lost_locked)
+        ok = False
+
+    # 心跳探针（v0.8）
+    advanced, got_b = probe_heartbeat()
+    if advanced and not got_b:
+        print("PASS  lock_check.py: 心跳刷新 mtime，活锁未被误接管")
+    else:
+        print("FAIL  lock_check.py: 心跳失效（mtime 推进=%s，被误接管=%s）"
+              % (advanced, got_b))
+        ok = False
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
