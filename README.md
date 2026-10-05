@@ -1,5 +1,7 @@
 # AI 抬头 (ai-look-up)
 
+[![ci](https://github.com/1344738825/ai-look-up/actions/workflows/ci.yml/badge.svg)](https://github.com/1344738825/ai-look-up/actions/workflows/ci.yml)
+
 让 AI 在长时间空跑时**中途自我审查**的 ZCode 插件。
 
 AI 长任务里最常见的浪费不是做错,而是**空跑**:换名字重跑同一个探针脚本(`_peek2.py`、`_peek3.py`、`_peek4.py`…)、盲目重试失败的命令、一两个小时只跑不改却毫无产出。本插件通过会话钩子持续观察 AI 的行为节奏,一旦命中空跑特征,就向对话注入一段「抬头」提醒,要求 AI 停下来对照目标、检查近几步是否带来新信息、决定继续 / 换方法 / 汇报。
@@ -72,6 +74,33 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 ```
 
 全部参数见 `/lookup-config`。
+
+## 双端能力差异(ZCode vs dsh)
+
+两个宿主共用同一套检测逻辑(阈值来自仓库根 `spec.json`,由 `test/golden_check.py` 与
+`test/golden.mjs` 双端金标测试钉住),但加载机制与配置面不同,**按宿主区分配置**:
+
+| 能力 | ZCode (Python hook) | DeepSeek Harness (JS bundle) |
+|---|---|---|
+| 触发检测(重复/失败/零产出/折返) | ✅ | ✅ |
+| 本地时钟锚点 | ✅ | ✅ |
+| 独立审查者 | 需配 `llm_api_key`(默认关) | 复用会话 `llm` 服务(默认开) |
+| 配置键命名 | `snake_case`(`llm_review`) | `camelCase`(`llmReview`) |
+| `llm_api_base` / `llm_model` / `llm_timeout_sec` | ✅ 生效 | ❌ 不读取;审查者模型跟随会话,如需换模型请在会话层设置 |
+| 状态持久化 | 落盘 `%TEMP%/zcode-ai-look-up/` | 进程内存,**宿主重启即丢状态** |
+
+> ⚠️ `llm_api_key` / `llm_api_base` / `llm_model` / `llm_timeout_sec` 只在 ZCode(Python)
+> 端被读取;dsh 用户配置它们不会生效也不会报错。
+
+## 行为规格与跨宿主适配
+
+- **`spec.json`** 是双端共享的行为规格(阈值、窗口、冷却、解释器清单等唯一事实源)。
+  两端启动时读取它覆盖内建默认值;缺文件时回退内建值。**改行为请改 spec.json,不要分别改两端代码。**
+- **`test/golden_cases.json`** 是双端金标用例(命令归一化签名 + 会话回放触发序列),
+  `test/golden_check.py`(Python)与 `test/golden.mjs`(JS)对同一份用例各跑一遍,
+  CI 里任一端漂移即红。
+- **`adapters/`** 提供其他钩子型宿主(Claude Code / OpenCode / Gemini CLI)的实验性
+  适配 shim——适配层只做事件与字段映射,不复制逻辑,详见 `adapters/README.md`。
 
 ## 状态与调试
 

@@ -39,6 +39,21 @@ PRODUCTIVE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "ApplyPatch"}
 # 会话闲置超过该秒数后,下一次事件视为新的工作时段
 STALE_AFTER_SEC = 2 * 3600
 
+def _load_spec():
+    """读取双端共享行为规格 spec.json(与脚本同仓库根);缺失/损坏时静默回退内建值。"""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "spec.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            spec = json.load(f)
+        if isinstance(spec, dict) and isinstance(spec.get("shared"), dict):
+            return spec["shared"]
+    except Exception:
+        pass
+    return {}
+
+
+_SPEC = _load_spec()
+
 DEFAULTS = {
     "enabled": True,
     # 连续 N 次工具调用且期间没有文件修改 → 注入通用提醒
@@ -76,6 +91,16 @@ DEFAULTS = {
     "llm_model": "deepseek-chat",
     "llm_timeout_sec": 12,
     "review_log_size": 12,
+    "review_log_floor": 40,
+    "max_recent_cmds": 8,
+    "settle_after_calls": 10,
+    "adaptive_warmup": 5,
+    "adaptive_low_rate": 0.3,
+    "adaptive_high_rate": 0.7,
+    "adaptive_backoff_mult": 2,
+    "adaptive_backoff_cap": 4,
+    "adaptive_tighten_mult": 0.75,
+    "adaptive_tighten_floor_sec": 60,
     # A) 折返编辑检测:同一文件的内容回到先前见过的状态(改了又改回)= 原地打转
     "edit_foldback": True,
     "foldback_window": 5,
@@ -88,6 +113,10 @@ DEFAULTS = {
     # 教训登记簿:失败循环自动登记坑位,回合开始时注入 Top 教训,防"认坑后再踩"
     "lessons": True,
 }
+
+for _k, _v in _SPEC.items():
+    if _k in DEFAULTS:
+        DEFAULTS[_k] = _v
 
 BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review", "edit_foldback", "adaptive", "drift_check", "lessons", "clock_tick_backoff"}
 
@@ -153,13 +182,13 @@ def kind_cooldown(cfg, kind, base):
     if not cfg.get("adaptive"):
         return base
     stats = load_adaptive().get(kind)
-    if not stats or stats.get("fired", 0) < 5:
+    if not stats or stats.get("fired", 0) < cfg["adaptive_warmup"]:
         return base
     rate = stats["effective"] / max(1, stats["fired"])
-    if rate < 0.3:
-        return min(base * 2, base * 4)
-    if rate > 0.7:
-        return max(base * 0.75, 60)
+    if rate < cfg["adaptive_low_rate"]:
+        return min(base * cfg["adaptive_backoff_mult"], base * cfg["adaptive_backoff_cap"])
+    if rate > cfg["adaptive_high_rate"]:
+        return max(base * cfg["adaptive_tighten_mult"], cfg["adaptive_tighten_floor_sec"])
     return base
 
 
@@ -171,15 +200,10 @@ def evaluate_pending(state, cfg):
     remaining = []
     changed = False
     for p in pending:
-        if state["tool_calls"] - p["calls_at"] < 10:
+        if state["tool_calls"] - p["calls_at"] < cfg["settle_after_calls"]:
             remaining.append(p)
             continue
-        effective = (state["edits"] - p["edits_at"] > 0) or (
-            state["fail_streak"] == 0 and p["fail"] > 0)
-        if not effective:
-            cur = state.get("recent_cmds", [])
-            n_last = cur[-1]["n"] if cur else ""
-            effective = bool(n_last) and n_last != p.get("norm", "")
+        effective = _is_effective(state, p)
         stats = load_adaptive()
         s = stats.setdefault(p["kind"], {"fired": 0, "effective": 0})
         s["fired"] = s.get("fired", 0) + 1
@@ -189,6 +213,21 @@ def evaluate_pending(state, cfg):
         changed = True
     if changed or remaining != pending:
         state["pending_reminders"] = remaining
+
+
+def _is_effective(state, p):
+    """按触发类型判断"提醒是否真的改变了行为"，而不是笼统看有没有编辑。"""
+    kind = p["kind"]
+    if kind in ("repeat-cmds", "exact-repeat"):
+        cur = state.get("recent_cmds", [])
+        return bool(cur) and cur[-1]["n"] != p.get("norm", "")
+    if kind == "fail-loop":
+        # fail_streak 会被任意一次成功清零,结算时几乎恒 0,不能作判据;
+        # 用累计失败数(total_failures 只增不清)对比快照,判"提醒后是否还有新失败"。
+        return state.get("total_failures", 0) == p.get("fails_at", -1)
+    if kind in ("no-output", "long-run", "edit-foldback"):
+        return state["edits"] - p["edits_at"] > 0
+    return (state["edits"] - p["edits_at"] > 0) or state["fail_streak"] == 0
 
 
 def lessons_path():
@@ -358,6 +397,7 @@ def new_state(sid, now):
         "edits": 0,
         "edits_since_reminder": 0,
         "calls_since_reminder": 0,
+        "calls_at_stretch_start": 0,
         "fail_streak": 0,
         "total_failures": 0,
         "recent_cmds": [],
@@ -408,6 +448,7 @@ def save_state(sid, state):
 def reset_stretch(state, cfg, now):
     """开启新的工作时段:重置回合内的节奏计数,保留会话累计。"""
     state["started_at"] = now
+    state["calls_at_stretch_start"] = state["tool_calls"]
     state["calls_since_reminder"] = 0
     state["edits_since_reminder"] = 0
     state["fail_streak"] = 0
@@ -429,26 +470,38 @@ def extract_cmd(data):
     return ""
 
 
+_SCRIPT_EXTS = _SPEC.get("script_extensions", ["py", "js", "ts", "mjs", "cjs", "sh", "ps1", "bat"])
+SCRIPT_RX = re.compile(r"\.(?:" + "|".join(map(re.escape, _SCRIPT_EXTS)) + r")$", re.I)
+INTERPRETERS = set(_SPEC.get("interpreters",
+                             ["python", "python3", "py", "node", "bash", "sh", "pwsh", "powershell", "perl", "ruby"]))
+SEQ_RX = re.compile(r"[\d_-]+(?=\.\w+$)")
+
+
 def norm_cmd(cmd):
     """把一条命令归一化成"程序 + 目标主体",用于识别换汤不换药的重复执行。
 
-    python _peek2.py  /  python _peek3.py  /  python "_peek4.py"  →  "python _peek"
+    python _peek2.py / python _peek3.py  →  "python _peek.py"   (判定重复)
+    grep -rn "foo" a / grep -rn "bar" b  →  不同                (不判重复)
     """
     s = (cmd or "").strip().lower()
     if not s:
         return ""
     s = re.sub(r"\s+", " ", s)
-    # 取管道/链式命令的最后一段(前面的是准备动作)
-    parts = re.split(r"&&|\|\||;|\|", s)
+    parts = re.split(r"&&|\|\||;", s)
     s = parts[-1].strip() if parts else s
-    toks = s.split(" ")
+    toks = [t for t in s.split(" ") if t]
+    if not toks:
+        return ""
     head = toks[0].replace("\\", "/").split("/")[-1].strip("\"'")
     head = re.sub(r"\.exe$", "", head)
-    second = toks[1] if len(toks) > 1 else ""
-    second = second.replace("\\", "/").split("/")[-1].strip("\"'")
-    second = re.sub(r"\.(py|js|ts|mjs|cjs|sh|json|md|txt|log|csv|yaml|yml)$", "", second)
-    second = re.sub(r"[\d_-]+$", "", second)
-    return (head + " " + second).strip()
+
+    if head in INTERPRETERS and len(toks) > 1:
+        second = toks[1].replace("\\", "/").split("/")[-1].strip("\"'")
+        if SCRIPT_RX.search(second):
+            return (head + " " + SEQ_RX.sub("", second)).strip()
+        return s   # 非脚本形态不截断:任何 token 截断都会制造误报(-c 脚本/build2/git 分支)
+
+    return s
 
 
 def raw_cmd(cmd):
@@ -487,7 +540,7 @@ def fmt_minutes(state, now):
     return max(0.0, (now - state.get("started_at", now)) / 60.0)
 
 
-def fire(state, cfg, now, kind, text, cooldown):
+def fire(state, cfg, now, kind, text, cooldown, fail_at=None):
     if not cfg["enabled"]:
         return None
     if state["reminders"] >= cfg["max_reminders"]:
@@ -505,7 +558,8 @@ def fire(state, cfg, now, kind, text, cooldown):
         "kind": kind,
         "calls_at": state["tool_calls"],
         "edits_at": state["edits"],
-        "fail": state["fail_streak"],
+        "fail": state["fail_streak"] if fail_at is None else fail_at,
+        "fails_at": state.get("total_failures", 0),
         "norm": cur[-1]["n"] if cur else "",
     })
     state["pending_reminders"] = pending[-10:]
@@ -521,7 +575,9 @@ def nudge_text(state, cfg, now, specific):
     lines = [
         "🔔 【AI 抬头 · 中途自我审查】时钟 {h},本段 {m:.0f} 分钟/{c} 次调用,修改 {e} 次。停一下,自查:".format(
             h=local_hm(now), m=mins,
-            c=state["calls_since_reminder"], e=state["edits_since_reminder"]),
+            c=max(0, state["tool_calls"] - state.get("calls_at_stretch_start", 0))
+            if state.get("calls_at_stretch_start") is not None else state["calls_since_reminder"],
+            e=state["edits_since_reminder"]),
         "① 对照最初目标是否偏移?② 最近 5 次调用有无新信息?若无 → 正在空跑。",
     ]
     if specific:
@@ -694,6 +750,7 @@ def handle_post_use(cfg, data, state, now):
     state["tool_calls"] += 1
     state["calls_since_reminder"] += 1
     state["by_tool"][tool] = state["by_tool"].get(tool, 0) + 1
+    fail_before = state["fail_streak"]       # 保存清零前的连败数,供 pending 快照
     state["fail_streak"] = 0
 
     if tool in PRODUCTIVE_TOOLS:
@@ -710,7 +767,7 @@ def handle_post_use(cfg, data, state, now):
         if n or r:
             recent = state.get("recent_cmds", [])
             recent.append({"t": now, "n": n, "r": r})
-            state["recent_cmds"] = recent[-8:]
+            state["recent_cmds"] = recent[-cfg["max_recent_cmds"]:]
     log = state.get("recent_log", [])
     log.append({"tool": tool, "brief": brief_of(data, tool), "ok": True})
     # 原始条目保留窗口放宽(材料构造时才按段折叠压缩),否则关键旧证据进不了材料
@@ -733,6 +790,7 @@ def handle_post_use(cfg, data, state, now):
                     p=fb_path),
             ),
             kind_cooldown(cfg, "edit-foldback", cfg["cooldown_sec"]),
+            fail_at=fail_before,
         )
         if text:
             return post_use_output(finalize_text(
@@ -752,6 +810,7 @@ def handle_post_use(cfg, data, state, now):
                         n=hit["count"], cmd=hit["raw"][:120]),
                 ),
                 kind_cooldown(cfg, "exact-repeat", cfg["cooldown_sec"]),
+                fail_at=fail_before,
             )
             if text:
                 return post_use_output(finalize_text(
@@ -771,6 +830,7 @@ def handle_post_use(cfg, data, state, now):
                         p=hit["prefix"], n=hit["count"]),
                 ),
                 kind_cooldown(cfg, "repeat-cmds", cfg["cooldown_sec"]),
+                fail_at=fail_before,
             )
             if text:
                 return post_use_output(finalize_text(
@@ -790,6 +850,7 @@ def handle_post_use(cfg, data, state, now):
                     m=fmt_minutes(state, now)),
             ),
             kind_cooldown(cfg, "long-run", cfg["cooldown_sec"]),
+            fail_at=fail_before,
         )
         if text:
             return post_use_output(finalize_text(
@@ -808,6 +869,7 @@ def handle_post_use(cfg, data, state, now):
                     c=state["calls_since_reminder"]),
             ),
             kind_cooldown(cfg, "no-output", cfg["cooldown_sec"]),
+            fail_at=fail_before,
         )
         if text:
             return post_use_output(finalize_text(
@@ -854,7 +916,7 @@ def handle_post_fail(cfg, data, state, now):
     log = state.get("recent_log", [])
     log.append({"tool": str(data.get("tool_name") or data.get("toolName") or "Unknown"),
                 "brief": brief_of(data, str(data.get("tool_name") or data.get("toolName") or "Unknown")), "ok": False})
-    state["recent_log"] = log[-cfg["review_log_size"]:]
+    state["recent_log"] = log[-max(cfg["review_log_floor"], cfg["review_log_size"]):]
     if state["fail_streak"] < cfg["fail_streak_threshold"]:
         return None
     if now - state.get("last_fail_reminder_at", 0.0) < kind_cooldown(cfg, "fail-loop", cfg["fail_cooldown_sec"]):

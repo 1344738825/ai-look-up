@@ -25,6 +25,50 @@ import { readFile } from 'node:fs/promises';
 
 const PRODUCTIVE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'ApplyPatch']);
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+// ---- spec.json: single source of truth shared with the Python hook ----
+const KEY_MAP = {
+  call_nudge_interval: 'callNudgeInterval',
+  repeat_window: 'repeatWindow',
+  repeat_cmd_count: 'repeatCmdCount',
+  repeat_min_calls: 'repeatMinCalls',
+  max_recent_cmds: 'maxRecentCmds',
+  fail_streak_threshold: 'failStreakThreshold',
+  long_run_minutes: 'longRunMinutes',
+  long_run_min_calls: 'longRunMinCalls',
+  cooldown_sec: 'cooldownSec',
+  fail_cooldown_sec: 'failCooldownSec',
+  max_reminders: 'maxReminders',
+  stop_min_calls: 'stopMinCalls',
+  clock_tick_minutes: 'clockTickMinutes',
+  clock_tick_max_minutes: 'clockTickMaxMinutes',
+  foldback_window: 'foldbackWindow',
+  review_log_size: 'reviewLogSize',
+  review_log_floor: 'reviewLogFloor',
+  settle_after_calls: 'settleAfterCalls',
+  adaptive_warmup: 'adaptiveWarmup',
+  adaptive_low_rate: 'adaptiveLowRate',
+  adaptive_high_rate: 'adaptiveHighRate',
+  adaptive_backoff_mult: 'adaptiveBackoffMult',
+  adaptive_backoff_cap: 'adaptiveBackoffCap',
+  adaptive_tighten_mult: 'adaptiveTightenMult',
+  adaptive_tighten_floor_sec: 'adaptiveTightenFloorSec',
+  drift_check_calls: 'driftCheckCalls',
+  drift_cooldown_sec: 'driftCooldownSec',
+};
+
+function loadSpec() {
+  try {
+    const spec = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), 'spec.json'), 'utf8'));
+    if (spec && typeof spec === 'object' && spec.shared && typeof spec.shared === 'object') return spec.shared;
+  } catch { /* fall back to built-in defaults below */ }
+  return {};
+}
+const SPEC = loadSpec();
+
 const DEFAULTS = {
   enabled: true,
   callNudgeInterval: 30,
@@ -44,6 +88,15 @@ const DEFAULTS = {
   clockTickBackoff: true,
   clockTickMaxMinutes: 60,
   maxRecentCmds: 8,
+  reviewLogFloor: 40,
+  settleAfterCalls: 10,
+  adaptiveWarmup: 5,
+  adaptiveLowRate: 0.3,
+  adaptiveHighRate: 0.7,
+  adaptiveBackoffMult: 2,
+  adaptiveBackoffCap: 4,
+  adaptiveTightenMult: 0.75,
+  adaptiveTightenFloorSec: 60,
   // independent reviewer (v0.4): one LLM call per trigger, strict JSON verdict
   llmReview: true,
   llmTimeoutMs: 20000,
@@ -60,6 +113,11 @@ const DEFAULTS = {
   // lesson ledger (v0.5): failures register pitfalls, new agents get the top ones
   lessons: true,
 };
+
+for (const [snake, v] of Object.entries(SPEC)) {
+  const camel = KEY_MAP[snake];
+  if (camel && camel in DEFAULTS) DEFAULTS[camel] = v;
+}
 
 const DRIFT_LABEL = {
   'on-track': '仍在服务主线',
@@ -153,20 +211,30 @@ function mergeConfig(config) {
   return cfg;
 }
 
+const _escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const SCRIPT_RX = new RegExp('\\.(?:' + (SPEC.script_extensions ?? ['py', 'js', 'ts', 'mjs', 'cjs', 'sh', 'ps1', 'bat']).map(_escapeRe).join('|') + ')$', 'i');
+const INTERPRETERS = new Set(SPEC.interpreters ?? ['python', 'python3', 'py', 'node', 'bash', 'sh', 'pwsh', 'powershell', 'perl', 'ruby']);
+const SEQ_RX = /[\d_-]+(?=\.\w+$)/;
+
 function normCmd(cmd) {
   let s = String(cmd ?? '').trim().toLowerCase();
   if (!s) return '';
   s = s.replace(/\s+/g, ' ');
-  const parts = s.split(/&&|\|\||;|\|/);
+  // 只切"准备动作"(&& || ;)——管道 | 是数据流,不切
+  const parts = s.split(/&&|\|\||;/);
   s = (parts[parts.length - 1] || s).trim();
-  const toks = s.split(' ');
+  const toks = s.split(' ').filter(Boolean);
+  if (!toks.length) return '';
   let head = (toks[0] ?? '').replace(/\\/g, '/').split('/').pop().replace(/^["']|["']$/g, '');
   head = head.replace(/\.exe$/, '');
-  let second = toks.length > 1 ? toks[1] : '';
-  second = second.replace(/\\/g, '/').split('/').pop().replace(/^["']|["']$/g, '');
-  second = second.replace(/\.(py|js|ts|mjs|cjs|sh|json|md|txt|log|csv|yaml|yml)$/, '');
-  second = second.replace(/[\d_-]+$/, '');
-  return (head + ' ' + second).trim();
+
+  // 解释器 + 脚本文件:归一化脚本名里的序号(_peek2.py → _peek.py)
+  if (INTERPRETERS.has(head) && toks.length > 1) {
+    const second = (toks[1] ?? '').replace(/\\/g, '/').split('/').pop().replace(/^["']|["']$/g, '');
+    if (SCRIPT_RX.test(second)) return (head + ' ' + second.replace(SEQ_RX, '')).trim();
+    return s;   // 非脚本形态不截断:任何 token 截断都会制造误报(-c 脚本/build2/git 分支)
+  }
+  return s;
 }
 
 const rawCmd = (cmd) => String(cmd ?? '').trim().replace(/\s+/g, ' ');
@@ -250,7 +318,7 @@ function exactRepeatHit(state, cfg) {
   return count >= cfg.repeatCmdCount ? { raw: last, count } : null;
 }
 
-function fire(state, cfg, now, kind, text, cooldownMs) {
+function fire(state, cfg, now, kind, text, cooldownMs, failAt = null) {
   if (!cfg.enabled) return null;
   if (state.reminders >= cfg.maxReminders) return null;
   if (now - state.lastReminderAt < cooldownMs) return null;
@@ -264,7 +332,8 @@ function fire(state, cfg, now, kind, text, cooldownMs) {
     kind,
     callsAt: state.toolCalls,
     editsAt: state.edits,
-    fail: state.failStreak,
+    fail: failAt ?? state.failStreak,
+    failsAt: state.totalFailures ?? 0,
     norm: cur.length ? cur[cur.length - 1].n : '',
   });
   state.pendingReminders = state.pendingReminders.slice(-10);
@@ -272,28 +341,39 @@ function fire(state, cfg, now, kind, text, cooldownMs) {
 }
 
 /** Adaptive cooldown per trigger kind: ineffective reminders back off, effective ones tighten. */
-function kindCooldown(kind, base) {
+function kindCooldown(cfg, kind, base) {
   const stats = adaptiveStats.get(kind);
-  if (!stats || stats.fired < 5) return base;
+  if (!stats || stats.fired < cfg.adaptiveWarmup) return base;
   const rate = stats.effective / Math.max(1, stats.fired);
-  if (rate < 0.3) return Math.min(base * 2, base * 4);
-  if (rate > 0.7) return Math.max(base * 0.75, 60000);
+  if (rate < cfg.adaptiveLowRate) return Math.min(base * cfg.adaptiveBackoffMult, base * cfg.adaptiveBackoffCap);
+  if (rate > cfg.adaptiveHighRate) return Math.max(base * cfg.adaptiveTightenMult, cfg.adaptiveTightenFloorSec * 1000);
   return base;
 }
 
-/** Settle reminders fired ≥10 calls ago: an edit, a stopped failure streak, or a changed command pattern counts as effective. */
-function evaluatePending(state) {
+/** Settle reminders fired ≥10 calls ago: did the behavior that triggered this kind actually stop? */
+function isEffective(state, p) {
+  const kind = p.kind;
+  if (kind === 'repeat-cmds' || kind === 'exact-repeat') {
+    const cur = state.recentCmds;
+    return cur.length > 0 && cur[cur.length - 1].n !== (p.norm ?? '');
+  }
+  if (kind === 'fail-loop') {
+    // failStreak is cleared by any success; compare the cumulative failure count instead
+    return (state.totalFailures ?? 0) === (p.failsAt ?? -1);
+  }
+  if (kind === 'no-output' || kind === 'long-run' || kind === 'edit-foldback') {
+    return state.edits - p.editsAt > 0;
+  }
+  return state.edits - p.editsAt > 0 || (state.totalFailures ?? 0) === (p.failsAt ?? -1);
+}
+
+function evaluatePending(state, cfg) {
   if (!state.pendingReminders.length) return;
   const remaining = [];
   let changed = false;
   for (const p of state.pendingReminders) {
-    if (state.toolCalls - p.callsAt < 10) { remaining.push(p); continue; }
-    let effective = (state.edits - p.editsAt > 0) || (state.failStreak === 0 && p.fail > 0);
-    if (!effective) {
-      const cur = state.recentCmds;
-      const last = cur.length ? cur[cur.length - 1].n : '';
-      effective = Boolean(last) && last !== p.norm;
-    }
+    if (state.toolCalls - p.callsAt < cfg.settleAfterCalls) { remaining.push(p); continue; }
+    const effective = isEffective(state, p);
     const stats = adaptiveStats.get(p.kind) ?? { fired: 0, effective: 0 };
     stats.fired += 1;
     if (effective) stats.effective += 1;
@@ -636,7 +716,7 @@ export function apply(ctx, config) {
             const nowFb = Date.now();
             const text = fire(st, cfg, nowFb, 'edit-foldback', nudgeText(st, cfg, nowFb,
               '文件 ' + hit.path + ' 的内容回到了先前见过的状态——改了又改回是典型的原地打转,'
-              + '请确认这条修改路径是否还有意义。'), kindCooldown('edit-foldback', cfg.cooldownSec * 1000));
+              + '请确认这条修改路径是否还有意义。'), kindCooldown(cfg, 'edit-foldback', cfg.cooldownSec * 1000));
             if (text) deliverOrReview(agent, st, 'edit-foldback',
               '文件内容折返: ' + hit.path, text);
           }).catch(() => { /* fold-back detection is best-effort */ });
@@ -652,13 +732,14 @@ export function apply(ctx, config) {
       }
 
       const isError = result?.isError === true;
+      const failBefore = st.failStreak;   // 成功路径会在下面清零,先存快照供 fire() 用
       if (isError) {
         st.failStreak += 1;
         st.totalFailures += 1;
         st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: false });
         st.recentLog = st.recentLog.slice(-Math.max(40, cfg.reviewLogSize));
         if (st.failStreak >= cfg.failStreakThreshold
-            && now - st.lastFailReminderAt >= kindCooldown('fail-loop', cfg.failCooldownSec * 1000)
+            && now - st.lastFailReminderAt >= kindCooldown(cfg, 'fail-loop', cfg.failCooldownSec * 1000)
             && st.reminders < cfg.maxReminders && cfg.enabled) {
           st.reminders += 1;
           st.lastReminderAt = now;
@@ -694,7 +775,7 @@ export function apply(ctx, config) {
 
       if (!cfg.enabled) return;
 
-      evaluatePending(st);
+      evaluatePending(st, cfg);
 
       // triggers, strongest evidence first
       if (st.callsSinceReminder >= cfg.repeatMinCalls) {
@@ -702,7 +783,7 @@ export function apply(ctx, config) {
         if (exact) {
           const text = fire(st, cfg, now, 'exact-repeat', nudgeText(st, cfg, now,
             '完全相同的命令已原样执行 ' + exact.count + ' 次:`' + exact.raw.slice(0, 120)
-            + '`。同样的输入必然得到同样的结果——请换参数、换方法,或停下来重新评估。'), kindCooldown('exact-repeat', cfg.cooldownSec * 1000));
+            + '`。同样的输入必然得到同样的结果——请换参数、换方法,或停下来重新评估。'), kindCooldown(cfg, 'exact-repeat', cfg.cooldownSec * 1000), failBefore);
           if (text) { deliverOrReview(agent, st, 'exact-repeat',
             '原样命令重复 ' + exact.count + ' 次: ' + exact.raw.slice(0, 100), text); return; }
         }
@@ -710,7 +791,7 @@ export function apply(ctx, config) {
         if (repeat) {
           const text = fire(st, cfg, now, 'repeat-cmds', nudgeText(st, cfg, now,
             '检测到重复执行:归一化后为 "' + repeat.prefix + ' …" 的命令在本段已出现 '
-            + repeat.count + ' 次。同样的命令大概率得到同样的结果——请换参数、换思路,或停下来重新评估。'), kindCooldown('repeat-cmds', cfg.cooldownSec * 1000));
+            + repeat.count + ' 次。同样的命令大概率得到同样的结果——请换参数、换思路,或停下来重新评估。'), kindCooldown(cfg, 'repeat-cmds', cfg.cooldownSec * 1000), failBefore);
           if (text) { deliverOrReview(agent, st, 'repeat-cmds',
             '相似命令重复 ' + repeat.count + ' 次: ' + repeat.prefix, text); return; }
         }
@@ -719,14 +800,14 @@ export function apply(ctx, config) {
           && st.callsSinceReminder >= cfg.longRunMinCalls) {
         const text = fire(st, cfg, now, 'long-run', nudgeText(st, cfg, now,
           '本段会话已持续约 ' + minutesSince(st, now).toFixed(0)
-          + ' 分钟,还没有任何文件被修改。如果当前路径走不通,请考虑向用户说明卡点,而不是继续消耗时间。'), kindCooldown('long-run', cfg.cooldownSec * 1000));
+          + ' 分钟,还没有任何文件被修改。如果当前路径走不通,请考虑向用户说明卡点,而不是继续消耗时间。'), kindCooldown(cfg, 'long-run', cfg.cooldownSec * 1000), failBefore);
         if (text) { deliverOrReview(agent, st, 'long-run',
           '运行 ' + minutesSince(st, now).toFixed(0) + ' 分钟零修改', text); return; }
       }
       if (st.callsSinceReminder >= cfg.callNudgeInterval && st.editsSinceReminder === 0) {
         const text = fire(st, cfg, now, 'no-output', nudgeText(st, cfg, now,
           '自上次审查以来 ' + st.callsSinceReminder
-          + ' 次工具调用没有产生任何文件修改——要么是在合理地调研,要么是在空跑。请用证据判断是哪一种。'), kindCooldown('no-output', cfg.cooldownSec * 1000));
+          + ' 次工具调用没有产生任何文件修改——要么是在合理地调研,要么是在空跑。请用证据判断是哪一种。'), kindCooldown(cfg, 'no-output', cfg.cooldownSec * 1000), failBefore);
         if (text) { deliverOrReview(agent, st, 'no-output',
           st.callsSinceReminder + ' 次调用零修改', text); return; }
       }
@@ -769,3 +850,6 @@ export function apply(ctx, config) {
     }
   });
 }
+
+/** Test-only internals for golden conformance checks (no runtime consumers). */
+export const __test = { normCmd, rawCmd, defaults: { ...DEFAULTS } };

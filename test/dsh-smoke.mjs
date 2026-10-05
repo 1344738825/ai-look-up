@@ -318,4 +318,50 @@ const texts = (agent) =>
   console.log('PASS  lessons force re-injection on the 5th prompt');
 }
 
+// 17) P0-1 counterexample: distinct greps / branch switches must NOT collapse into repeat-cmds
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  for (let i = 0; i < 5; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
+  const greps = [
+    'grep -rn "foo" a.txt', 'grep -rn "bar" b.txt', 'git checkout main',
+    'git checkout dev', 'npm run build', 'npm run build2',
+  ];
+  for (const c of greps) emit('tools/result', exec(agent, 'Bash', { command: c }), { isError: false });
+  // 11 次调用零编辑会合法触发 no-output 提醒;这里只断言 repeat 类判定不出现
+  assert(!texts(agent).some((t) => t.includes('重复执行') || t.includes('原样执行')),
+    'distinct commands must not be judged as grinding');
+  console.log('PASS  distinct greps / branch switches stay silent (P0-1)');
+}
+
+// 18) P0-1 true positive kept: numbered peek scripts still collapse and trigger
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  for (let i = 0; i < 5; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
+  for (const c of ['python _peek2.py', 'python _peek3.py', 'python _peek4.py']) {
+    emit('tools/result', exec(agent, 'Bash', { command: c }), { isError: false });
+  }
+  assert(texts(agent).some((t) => t.includes('重复执行')), 'numbered probe scripts must still trigger repeat-cmds');
+  console.log('PASS  numbered peek scripts still trigger repeat-cmds (P0-1 true positive)');
+}
+
+// 19) P0-1 side-effect ruling: different python -c bodies must NOT collapse
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  for (let i = 0; i < 5; i++) emit('tools/result', exec(agent, 'Read', { file_path: 'a.txt' }), { isError: false });
+  for (const c of [
+    "python -c \"print(len(open('a.txt').read()))\"",
+    "python -c \"print(len(open('b.txt').read()))\"",
+    'python -c "print(sum(range(10)))"',
+  ]) emit('tools/result', exec(agent, 'Bash', { command: c }), { isError: false });
+  assert(!texts(agent).some((t) => t.includes('重复执行') || t.includes('原样执行')),
+    'distinct -c bodies must not be judged as grinding');
+  console.log('PASS  distinct python -c bodies stay silent (P0-1 side effect)');
+}
+
 console.log('ALL DSH SMOKE TESTS PASSED');

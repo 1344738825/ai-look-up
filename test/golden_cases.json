@@ -1,0 +1,77 @@
+{
+  "_comment": "双端一致性金标用例。test/golden_check.py 与 test/golden.mjs 必须对同一份用例产出完全一致的结果(CI 里双端任一漂移即红)。",
+  "norm": [
+    { "cmd": "python _peek2.py", "want": "python _peek.py" },
+    { "cmd": "python _peek3.py", "want": "python _peek.py" },
+    { "cmd": "python \"_peek4.py\"", "want": "python _peek.py" },
+    { "cmd": "node peek1.js", "want": "node peek.js" },
+    { "cmd": "python probe_v2.py", "want": "python probe_v.py" },
+    { "cmd": "python /tmp/_peek2.py", "want": "python _peek.py" },
+    { "cmd": "cd /d && python _peek2.py", "want": "python _peek.py" },
+    { "cmd": "grep -rn \"foo\" a.txt", "want": "grep -rn \"foo\" a.txt" },
+    { "cmd": "git checkout main", "want": "git checkout main" },
+    { "cmd": "npm run build2", "want": "npm run build2" },
+    { "cmd": "pip install numpy", "want": "pip install numpy" },
+    { "cmd": "cat a.txt | grep foo", "want": "cat a.txt | grep foo" },
+    { "cmd": "curl https://a.com/x", "want": "curl https://a.com/x" },
+    { "cmd": "git status", "want": "git status" },
+    { "cmd": "", "want": "" }
+  ],
+  "sessions": [
+    {
+      "name": "peek grinding fires repeat-cmds",
+      "events": [
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Bash", "cmd": "python _peek2.py", "fail": false },
+        { "tool": "Bash", "cmd": "python _peek3.py", "fail": false },
+        { "tool": "Bash", "cmd": "python _peek4.py", "fail": false }
+      ],
+      "want_kinds": ["重复执行"]
+    },
+    {
+      "name": "distinct greps / branch switches stay silent",
+      "events": [
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Bash", "cmd": "grep -rn \"foo\" a.txt", "fail": false },
+        { "tool": "Bash", "cmd": "grep -rn \"bar\" b.txt", "fail": false },
+        { "tool": "Bash", "cmd": "git checkout main", "fail": false },
+        { "tool": "Bash", "cmd": "git checkout dev", "fail": false },
+        { "tool": "Bash", "cmd": "npm run build", "fail": false },
+        { "tool": "Bash", "cmd": "npm run build2", "fail": false }
+      ],
+      "want_kinds": []
+    },
+    {
+      "name": "3 consecutive failures fire fail-loop",
+      "events": [
+        { "tool": "Bash", "cmd": "python x.py", "fail": true },
+        { "tool": "Bash", "cmd": "python x.py", "fail": true },
+        { "tool": "Bash", "cmd": "python x.py", "fail": true }
+      ],
+      "want_kinds": ["失败循环"]
+    },
+    {
+      "name": "3 identical raw commands fire exact-repeat",
+      "events": [
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Read", "fail": false },
+        { "tool": "Bash", "cmd": "git status", "fail": false },
+        { "tool": "Bash", "cmd": "git status", "fail": false },
+        { "tool": "Bash", "cmd": "git status", "fail": false }
+      ],
+      "want_kinds": ["原样执行"]
+    }
+  ]
+}
