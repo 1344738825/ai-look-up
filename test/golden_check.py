@@ -83,6 +83,31 @@ for session in CASES:
     ok = kinds == session["want_kinds"]
     check("session %s" % session["name"], ok, "got %s want %s" % (kinds, session["want_kinds"]))
 
+# 4) 行为级变异(补金标盲区):spec 键不能只落进 DEFAULTS,必须在真实执行路径上生效。
+#    断言方式 = 走真实 handle_post_use / handle_post_fail 观察可观测行为,
+#    不手工复刻任何被测逻辑(手工复刻 = 假阳性,教训见 WorkBuddy 2026-10-06 复核信 §3.2)。
+def probe_log_window(path, floor):
+    cfg2 = dict(lk.DEFAULTS)
+    cfg2["review_log_floor"] = floor
+    cfg2["review_log_size"] = 12
+    st = lk.new_state("mutation-%s-%d" % (path, floor), 1000.0)
+    for i in range(60):
+        data = {"tool_name": "Bash", "tool_input": {"command": "cmd%d" % i}}
+        if path == "fail":
+            lk.handle_post_fail(cfg2, data, st, 1000.0 + i)
+        else:
+            lk.handle_post_use(cfg2, data, st, 1000.0 + i)
+    return len(st["recent_log"])
+
+
+check("mutation review_log_floor=137 fail path keeps all", probe_log_window("fail", 137) == 60)
+check("mutation review_log_floor=137 success path keeps all", probe_log_window("use", 137) == 60)
+check("mutation review_log_floor=5 falls back to review_log_size",
+      probe_log_window("fail", 5) == 12 and probe_log_window("use", 5) == 12)
+check("default review_log_floor=40 caps the window",
+      probe_log_window("fail", lk.DEFAULTS["review_log_floor"]) == 40
+      and probe_log_window("use", lk.DEFAULTS["review_log_floor"]) == 40)
+
 print()
 print("golden_check.py: %s" % ("ALL PASSED" if fails == 0 else "%d FAILURES" % fails))
 sys.exit(0 if fails == 0 else 1)

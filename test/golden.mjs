@@ -142,6 +142,21 @@ for (const session of CASES.sessions) {
   });
 }
 
+// 4) 行为级变异的 JS 侧防线(源码 tripwire):
+//    reviewLogFloor 必须在 index.js 中被真实引用,且不允许残留字面量地板 40。
+//    局限:源码检查≠行为断言;JS 侧行为级探针受限于 state 不导出,
+//    后续可通过 __test 暴露 state 工厂补齐(见回信)。
+{
+  const src = readFileSync(join(ROOT, 'index.js'), 'utf8');
+  check('JS source tripwire: no literal Math.max(40', () => {
+    assert.ok(!/Math\.max\(40\b/.test(src), 'literal 40 floor is back in index.js');
+  });
+  check('JS source tripwire: reviewLogFloor referenced', () => {
+    assert.ok((src.match(/reviewLogFloor/g) || []).length >= 3,
+      'reviewLogFloor must appear in DEFAULTS + execution points');
+  });
+}
+
 console.log();
 console.log('golden.mjs: ' + (fails === 0 ? 'ALL PASSED' : fails + ' FAILURES'));
 process.exit(fails === 0 ? 0 : 1);

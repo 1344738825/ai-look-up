@@ -737,7 +737,7 @@ export function apply(ctx, config) {
         st.failStreak += 1;
         st.totalFailures += 1;
         st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: false });
-        st.recentLog = st.recentLog.slice(-Math.max(40, cfg.reviewLogSize));
+        st.recentLog = st.recentLog.slice(-Math.max(cfg.reviewLogFloor, cfg.reviewLogSize));
         if (st.failStreak >= cfg.failStreakThreshold
             && now - st.lastFailReminderAt >= kindCooldown(cfg, 'fail-loop', cfg.failCooldownSec * 1000)
             && st.reminders < cfg.maxReminders && cfg.enabled) {
@@ -770,7 +770,7 @@ export function apply(ctx, config) {
         st.failStreak = 0;
         st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: true });
         // raw window is generous; run-compression happens at material build time
-        st.recentLog = st.recentLog.slice(-Math.max(40, cfg.reviewLogSize));
+        st.recentLog = st.recentLog.slice(-Math.max(cfg.reviewLogFloor, cfg.reviewLogSize));
       }
 
       if (!cfg.enabled) return;

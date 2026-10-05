@@ -575,8 +575,8 @@ def nudge_text(state, cfg, now, specific):
     lines = [
         "🔔 【AI 抬头 · 中途自我审查】时钟 {h},本段 {m:.0f} 分钟/{c} 次调用,修改 {e} 次。停一下,自查:".format(
             h=local_hm(now), m=mins,
-            c=max(0, state["tool_calls"] - state.get("calls_at_stretch_start", 0))
-            if state.get("calls_at_stretch_start") is not None else state["calls_since_reminder"],
+            c=max(0, state["tool_calls"]
+                  - state.get("calls_at_stretch_start", state["tool_calls"] - state["calls_since_reminder"])),
             e=state["edits_since_reminder"]),
         "① 对照最初目标是否偏移?② 最近 5 次调用有无新信息?若无 → 正在空跑。",
     ]
@@ -771,7 +771,7 @@ def handle_post_use(cfg, data, state, now):
     log = state.get("recent_log", [])
     log.append({"tool": tool, "brief": brief_of(data, tool), "ok": True})
     # 原始条目保留窗口放宽(材料构造时才按段折叠压缩),否则关键旧证据进不了材料
-    state["recent_log"] = log[-max(40, cfg["review_log_size"]):]
+    state["recent_log"] = log[-max(cfg["review_log_floor"], cfg["review_log_size"]):]
 
     # ── 提醒有效性结算(自适应) ──
     evaluate_pending(state, cfg)

@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 _smoke_state/
+test/_golden_state_py/
