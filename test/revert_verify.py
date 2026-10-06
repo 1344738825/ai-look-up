@@ -20,6 +20,12 @@ import re
 import shutil
 import subprocess
 import sys
+
+# Windows 宿主默认 ANSI 代码页(cp1252/gbk 之外会炸),测试输出含中文,统一走 UTF-8。
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -331,14 +337,14 @@ verify(
 # ═══════════════════════════════════════════════════════════════════════════
 # 防线 9：v0.8 新发现 —— JS fold-back 的 hit 真值判定。
 #   recordEditHash 返回 {hit, path} 对象（永远为真值），调用方必须取 .hit。
-#   回退成 `if (!res || ...)` 后每次 Edit/Write 都会被误判为折返
+#   回退成 `if (res && ...)` 后每次 Edit/Write 都会被误判为折返
 #   → golden.mjs 的 foldbackWindow 两面断言（window=1 应为 0 次）必红。
 # ═══════════════════════════════════════════════════════════════════════════
 verify(
     "v0.8/JS: fold-back 用对象真值判定（每次改动都误判折返）",
     INDEX,
-    "            if (!res?.hit || !cfg.enabled) return;",
-    "            if (!res || !cfg.enabled) return;",
+    "            if (res?.hit && cfg.enabled) {",
+    "            if (res && cfg.enabled) {",
     [NODE, os.path.join(HERE, "golden.mjs")],
 )
 

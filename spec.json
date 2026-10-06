@@ -1,6 +1,6 @@
 {
   "_comment": "ai-look-up 双端共享行为规格 —— Python hook 与 JS bundle 的唯一事实源。两端启动时读取本文件覆盖内建默认值;缺文件时回退内建值(内建值必须与本文件一致)。键名统一 snake_case,JS 端由 KEY_MAP 翻译。",
-  "spec_version": "0.8.0",
+  "spec_version": "0.8.1",
   "shared": {
     "call_nudge_interval": 30,
     "repeat_window": 5,

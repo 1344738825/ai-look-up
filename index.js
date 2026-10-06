@@ -21,7 +21,6 @@
  */
 
 import { randomUUID, createHash } from 'node:crypto';
-import { readFile } from 'node:fs/promises';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 
@@ -424,8 +423,10 @@ function evaluatePending(state, cfg) {
  * Record the file content hash after each Edit/Write; content returning to a
  * previously seen state (ping-pong edits) is fold-back grinding. Returns
  * {hit, path}, or null when the file cannot be read.
+ * 必须同步读:tools/result 事件与下一次写盘之间没有任何顺序保证,异步读会把
+ * 后一次写入的内容当成这一次的指纹,折返永远判不出来(Python 侧同点位也是同步读)。
  */
-async function recordEditHash(state, cfg, exec) {
+function recordEditHash(state, cfg, exec) {
   const input = exec?.input ?? exec?.arguments ?? exec?.args ?? exec?.toolInput;
   if (!input || typeof input !== 'object') return null;
   const rawPath = input.file_path ?? input.path ?? input.notebook_path;
@@ -433,7 +434,7 @@ async function recordEditHash(state, cfg, exec) {
   const path = String(rawPath);
   let hash = '';
   try {
-    const content = await readFile(path);
+    const content = readFileSync(path);
     hash = createHash('md5').update(content).digest('hex').slice(0, 12);
   } catch {
     return null;
@@ -678,10 +679,25 @@ function takeReviewResults(st, cfg, now) {
  * dependency-free and degrades to the static checklist without the service.
  */
 function makeReviewer(ctx) {
-  let llm = (ctx && typeof ctx.llm === 'object') ? ctx.llm : null;
+  let llm = null;
+  // cordis 系宿主对未声明注入的服务访问会直接抛错(cannot get property "llm"
+  // without inject),必须把直读放进 try 内;抛错则降级到下面的 inject 路径。
+  try {
+    llm = (ctx && typeof ctx.llm === 'object') ? ctx.llm : null;
+  } catch { /* cordis: service access outside inject is forbidden */ }
   try {
     if (llm === null && typeof ctx?.inject === 'function') {
-      ctx.inject(['llm'], (svc) => { llm = svc; });
+      // inject 回调签名随 cordis 版本可能是 (svc) 或 (ctx2, svc),两种都兜住:
+      // 参数不像服务就回退到注入上下文内的 ctx.llm 直读(注入作用域内合法)。
+      ctx.inject(['llm'], (a, b) => {
+        const svc = (a && typeof a.stream === 'function') ? a
+          : (b && typeof b.stream === 'function') ? b : null;
+        if (svc) { llm = svc; return; }
+        try {
+          const viaCtx = (ctx && typeof ctx.llm === 'object') ? ctx.llm : null;
+          if (viaCtx) llm = viaCtx;
+        } catch { /* service not ready yet */ }
+      });
     }
   } catch (error) {
     ctx?.logger?.warn?.('[ai-look-up] llm service injection failed: %o', error);
@@ -692,7 +708,7 @@ function makeReviewer(ctx) {
       const header = agent?.session?.requestHeader?.();
       const provider = header?.config?.provider ?? '';
       const model = header?.config?.model ?? '';
-      if (llm === null) throw new Error('llm service unavailable');
+      if (llm === null || typeof llm.stream !== 'function') throw new Error('llm service unavailable');
       if (!provider || !model) throw new Error('no request-header route on this session');
       const options = {
         provider, model,
@@ -868,17 +884,19 @@ export function apply(ctx, config) {
         st.edits += 1;
         st.editsSinceReminder += 1;
         if (cfg.editFoldback) {
-          recordEditHash(st, cfg, exec).then((res) => {
-            // ★ 注意:res 是 {hit, path} 对象,永远为真值——必须取 .hit,
+          try {
+            const res = recordEditHash(st, cfg, exec);
+            // ★ 注意:res 是 {hit, path} 对象或 null——必须取 .hit 且判 null,
             //   否则每次改动都会误判为折返(与 Python 侧 record_edit_hash 返回布尔的语义对齐)。
-            if (!res?.hit || !cfg.enabled) return;
-            const nowFb = Date.now();
-            const text = fire(st, cfg, nowFb, 'edit-foldback', nudgeText(st, cfg, nowFb,
-              '文件 ' + res.path + ' 的内容回到了先前见过的状态——改了又改回是典型的原地打转,'
-              + '请确认这条修改路径是否还有意义。'), kindCooldown(cfg, 'edit-foldback', cfg.cooldownSec * 1000));
-            if (text) deliverOrReview(agent, st, 'edit-foldback',
-              '文件内容折返: ' + res.path, text);
-          }).catch(() => { /* fold-back detection is best-effort */ });
+            if (res?.hit && cfg.enabled) {
+              const nowFb = Date.now();
+              const text = fire(st, cfg, nowFb, 'edit-foldback', nudgeText(st, cfg, nowFb,
+                '文件 ' + res.path + ' 的内容回到了先前见过的状态——改了又改回是典型的原地打转,'
+                + '请确认这条修改路径是否还有意义。'), kindCooldown(cfg, 'edit-foldback', cfg.cooldownSec * 1000));
+              if (text) deliverOrReview(agent, st, 'edit-foldback',
+                '文件内容折返: ' + res.path, text);
+            }
+          } catch { /* fold-back detection is best-effort */ }
         }
       } else if (tool === 'Bash') {
         const cmd = extractCmd(exec);

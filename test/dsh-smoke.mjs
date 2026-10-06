@@ -590,4 +590,21 @@ const texts = (agent) =>
   console.log('PASS  new turn does not arm the cooldown, immediate grinding still injects (D3)');
 }
 
+// 16) cordis-hostile ctx: direct `ctx.llm` access throws without declared inject —
+//     plugin activation must survive (regression: dsh "cannot get property 'llm' without inject")
+{
+  const handlers = {};
+  const ctx = {
+    on(name, fn) { (handlers[name] ??= []).push(fn); },
+    logger: { warn: () => {} },
+    // cordis 语义:未声明注入就访问服务属性 → 直接抛错,而非返回 undefined
+    get llm() { throw new Error('cannot get property "llm" without inject'); },
+  };
+  // 直接以 cordis 风格 ctx 激活:激活本身绝不能抛
+  apply(ctx, { enabled: true });
+  const created = handlers['agent/created'] ?? [];
+  assert(created.length > 0, 'plugin must still register hooks when ctx.llm access throws');
+  console.log('PASS  activation survives a ctx whose llm getter throws (cordis semantics)');
+}
+
 console.log('ALL DSH SMOKE TESTS PASSED');

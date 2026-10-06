@@ -8,6 +8,8 @@ on:
 jobs:
   python:
     strategy:
+      # fail-fast 关掉:一个 OS 失败不影响另一个 OS,一次跑完拿到全部诊断
+      fail-fast: false
       matrix:
         # 双平台:ubuntu 验证跨平台行为与 POSIX 路径(state_lock/channel);
         # windows 验证平台专属防线(revert_verify 的 win32 限定用例在 Linux 上
@@ -41,6 +43,7 @@ jobs:
 
   node:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
