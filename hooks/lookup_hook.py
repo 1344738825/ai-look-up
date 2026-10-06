@@ -578,9 +578,19 @@ def load_state(sid, now):
 def save_state(sid, state):
     try:
         tmp = state_path(sid) + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=1)
-        os.replace(tmp, state_path(sid))
+        data = json.dumps(state, ensure_ascii=False, indent=1)
+        for attempt in range(3):
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.write(data)
+                os.replace(tmp, state_path(sid))
+                return
+            except OSError:
+                # Windows 上 replace 可能撞上并发读句柄的共享冲突；
+                # 静默放弃 = 直接丢一次状态更新，重试几次再放弃。
+                if attempt == 2:
+                    return
+                time.sleep(0.05 * (attempt + 1))
     except Exception:
         pass
 
@@ -731,7 +741,12 @@ class state_lock(object):
                     return self      # 超时：不阻塞会话，降级为无锁执行
                 time.sleep(0.02)
             except OSError:
-                return self
+                # 非 EEXIST 的瞬时错误（Windows 共享冲突/杀软扫描等）：
+                # 等在 deadline 内重试而不是立刻降级为无锁——无锁执行
+                # 会造成并发写互相覆盖（P2-1 的丢更新）。超时才放行保可用性。
+                if time.time() >= deadline:
+                    return self
+                time.sleep(0.02)
 
     def __exit__(self, *exc):
         if not self.acquired:

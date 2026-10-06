@@ -35,13 +35,18 @@ def run_concurrent():
         json.dump(seed, f)
     # 用一个共同的起跑闸：所有子进程先起好，再一起喂输入
     procs = []
+    err_paths = []
     for i in range(N):
+        ep = os.path.join(d, "child-%02d.stderr" % i)
+        ef = open(ep, "wb")
         p = subprocess.Popen(
             [sys.executable, HOOK, "post-use"],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=ef,
             env=env, text=True,
         )
+        ef.close()
         procs.append((p, i))
+        err_paths.append(ep)
     payloads = [json.dumps({"session_id": "locktest", "tool_name": "Read",
                             "tool_input": {"file_path": "f%d.txt" % i}}) for _, i in procs]
     # stdin 一起写、不等待读端，尽可能让各进程的读改写窗口重叠
@@ -53,10 +58,21 @@ def run_concurrent():
             p.stdin.close()
         except Exception:
             pass
+    codes = []
     for p, _ in procs:
-        p.wait()
+        codes.append(p.wait())
     with open(sp, encoding="utf-8") as f:
         st = json.load(f)
+    if st.get("tool_calls", 0) != N:
+        # 诊断：哪个子进程非 0 退出、stderr 写了什么——CI 上没这个没法查因。
+        print("DIAG  exit codes:", codes)
+        for ep in err_paths:
+            try:
+                content = open(ep, "rb").read().decode("utf-8", "replace").strip()
+            except OSError:
+                content = ""
+            if content:
+                print("DIAG  %s:\n%s" % (os.path.basename(ep), content[:2000]))
     return st.get("tool_calls", 0), d
 
 

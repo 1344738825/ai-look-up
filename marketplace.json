@@ -4,7 +4,7 @@
     {
       "name": "ai-look-up",
       "source": ".",
-      "version": "0.8.1",
+      "version": "0.8.2",
       "description": "Catches aimless AI grinding (repeated commands, failure loops, long runs with no output) and nudges the agent to stop and self-review mid-run. Also injects the real local time on a schedule, since agents are bad at judging how long they've been going. v0.7 adds an out-of-host review channel: the hook writes a request, and an independent watcher process (with its own API key) reviews asynchronously and sends back a verdict. The main agent never touches this path.",
       "displayName": "AI Look-Up",
       "displayName_i18n": {
