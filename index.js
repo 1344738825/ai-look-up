@@ -660,8 +660,10 @@ function takeReviewResults(st, cfg, now) {
     if (res.session_id && String(res.session_id) !== String(sid)) continue;
     // 闸1: 场景指纹——用户换过指令则结论作废
     if ((res.prompt_resets ?? 0) !== (st.promptResets ?? 0)) { safeUnlink(p); continue; }
-    // 闸2: 过期
-    if (now / 1000 - Number(res.finished_at ?? 0) > cfg.resultTtlSec) { safeUnlink(p); continue; }
+    // 闸2: 过期。finished_at 缺失或非数值一律作废——不可验证时效的结论不注入。
+    // (Number('abc') 为 NaN,NaN > ttl 恒为 false,会把坏数据放过去,故显式判 finite。)
+    const finishedAt = Number(res.finished_at);
+    if (!Number.isFinite(finishedAt) || now / 1000 - finishedAt > cfg.resultTtlSec) { safeUnlink(p); continue; }
     // 闸3: 步数——结论对应几十步前的现场,AI 已走远
     const stepsBack = st.toolCalls - Number(res.tool_calls ?? 0);
     if (stepsBack > cfg.resultSettleCalls) { safeUnlink(p); continue; }
@@ -738,6 +740,7 @@ export function apply(ctx, config) {
   const cfg = mergeConfig(config);
   const reviewer = makeReviewer(ctx);
   const state = new Map(); // agent object -> session state
+  let agentMissingWarned = false; // tools/result 不挂 agent 时只警告一次
   // 仅供测试读取会话状态的探测孔：宿主不设 __testState 时完全不暴露。
   if (ctx && ctx.__testState) {
     try { ctx.__testState(state); } catch { /* 探测孔失败不影响运行 */ }
@@ -861,7 +864,14 @@ export function apply(ctx, config) {
   ctx.on('tools/result', (exec, result) => {
     try {
       const agent = exec?.agent;
-      if (agent === undefined || agent === null) return;
+      if (agent === undefined || agent === null) {
+        // 宿主没往 exec 上挂 agent:整套检测静默失明。一次性留证,不刷屏。
+        if (!agentMissingWarned) {
+          agentMissingWarned = true;
+          ctx?.logger?.warn?.('[ai-look-up] tools/result 未携带 agent 引用,行为检测不会触发;请检查宿主版本的事件载荷。');
+        }
+        return;
+      }
       if (exec?.signal?.aborted) return;
       const st = stateOf(agent);
       const now = Date.now();
