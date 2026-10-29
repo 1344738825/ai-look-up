@@ -19,6 +19,7 @@ JS(`index.js`,DeepSeek Harness cordis bundle)。**适配层不做逻辑复制**,
 | ZCode | 原生(`hooks/hooks.json` + Python) | 完整(含 PostToolUseFailure) | ✅ 稳定 |
 | DeepSeek Harness | 原生(cordis bundle,纯 JS) | 完整 | ✅ 稳定 |
 | Claude Code | `claude-code/lookup_cc_adapter.py` shim | 失败事件经 `tool_response.is_error` 推导 | ⚠️ 实验性,未在真机验证 |
+| WorkBuddy / CodeBuddy CLI | `workbuddy/lookup_wb_adapter.py` shim(协议同 Claude Code,但用原生失败事件) | 完整(含 PostToolUseFailure) | ✅ 已真机验证(2026-10-30, WorkBuddy 5.9.x) |
 | OpenCode | `opencode/ai-look-up-adapter.js` shim(回调 Python 核心) | `tool.execute.after` 驱动;一次性模式(`opencode run`)下事件不可靠(官方已知问题) | ⚠️ 实验性,未在真机验证 |
 | Gemini CLI | `gemini-cli/`(映射文档 + 待校准 shim) | 依赖其 hooks v1 事件模型,需按官方文档核对字段名 | 🚧 脚手架 |
 
@@ -32,8 +33,9 @@ JS(`index.js`,DeepSeek Harness cordis bundle)。**适配层不做逻辑复制**,
 - stdout 原样透传(核心输出的就是宿主可消费的 hook JSON);核心静默时无输出。
 
 失败事件不独立的宿主(如 Claude Code)用"成功响应里带错误标志"推导 `post-fail`;
-两者都没有的宿主(纯 MCP 型,如 WorkBuddy)无法实现旁路监控,只能降级为
-主动查询型 MCP 工具或事后审计 skill——不在本目录范围内,见 README 主文档。
+WorkBuddy / CodeBuddy CLI 有独立的 `PostToolUseFailure`,直接映射即可,不需要推导,
+见 `workbuddy/lookup_wb_adapter.py`。真正没有生命周期钩子的宿主(纯 MCP 型客户端)
+无法实现旁路监控,只能降级为主动查询型 MCP 工具或事后审计 skill。
 
 > ⚠️ 除 ZCode / dsh 外的适配器均为社区贡献级别的**实验性**脚手架:
 > 字段名以各宿主当前版本文档为准,欢迎提 PR 补真机验证结果。
