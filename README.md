@@ -2,7 +2,9 @@
 
 [![ci](https://github.com/1344738825/ai-look-up/actions/workflows/ci.yml/badge.svg)](https://github.com/1344738825/ai-look-up/actions/workflows/ci.yml)
 
-让 AI 在长时间空跑时**中途自我审查**的 ZCode 插件。
+让 AI 在长时间空跑时**中途自我审查**的会话钩子。ZCode 原生支持,DeepSeek Harness 走 cordis
+bundle,WorkBuddy / CodeBuddy CLI 经 `adapters/workbuddy/` 接入;Claude Code / OpenCode /
+Gemini CLI 有实验性适配。
 
 AI 在长任务里最常见的浪费是**空跑**。表现是:同一个探针脚本换个名字反复跑(`_peek2.py`、`_peek3.py`、`_peek4.py`…),失败的命令原样重试,一两个小时里一次文件都没改。本插件用会话钩子盯着这些行为,命中就让 AI 停一下:对照最初目标,看最近几步有没有带来新东西,然后决定继续、换方法还是汇报。
 
@@ -16,7 +18,15 @@ AI 在长任务里最常见的浪费是**空跑**。表现是:同一个探针脚
 
 DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本仓库同时是一个 **cordis bundle**(`package.json` 声明 `dsh.bundle.patch`),会以 Host 插件形式安装,通过 `tools/result` / `session/event` 事件观察行为节奏,经 `agent.inject()` 注入提醒,无需 Python。
 
-**要求:** ZCode 安装方式需要系统可用 `python` 命令(3.8+),若可执行名不同,修改 `hooks/hooks.json` 中的 4 处 `python` 即可;dsh 安装方式无此要求(纯 JS)。
+**方式三:WorkBuddy / CodeBuddy CLI(手动配 hooks)**
+
+WorkBuddy 没有可安装的插件市场入口,直接改配置文件:在 `~/.codebuddy/settings.json`
+(或项目级 `<项目>/.codebuddy/settings.json`)的 `hooks` 键里注册四个事件,命令统一指向
+`adapters/workbuddy/lookup_wb_adapter.py`——shim 按 stdin 的 `hook_event_name` 自动判定动作。
+改完需新开会话才加载。完整片段与两个 Windows 坑(路径必须正斜杠、python 必须绝对路径)
+见 `adapters/workbuddy/README.md`。
+
+**要求:** ZCode 安装方式需要系统可用 `python` 命令(3.8+),若可执行名不同,修改 `hooks/hooks.json` 中的 4 处 `python` 即可;WorkBuddy 方式同上,且因为 hook 经 `bash -c` 执行,建议直接写 python 绝对路径;dsh 安装方式无此要求(纯 JS)。
 
 ## 工作原理
 
@@ -45,7 +55,7 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 
 **目标漂移巡检(v0.5)**:长上下文任务的隐性失败是子任务喧宾夺主——最初为核验某个决定而查的资料,做着做着变成了独立目标。每 30 次调用,独立审查者以漂移专项提示词对照最初任务审查一次方向;判定 `drifting/stuck` 时注入收束建议,`on-track` 时保持静默。需要审查者可用(见上)。
 
-**折返编辑检测(v0.5)**:对每次文件修改记录内容指纹,内容"改了又改回"到先前见过的状态即触发——原地打转靠纯统计就能抓,双端零 LLM 成本。
+**折返编辑检测(v0.5)**:对每次文件修改记录内容指纹,内容"改了又改回"到先前见过的状态即触发——原地打转靠纯统计就能抓,各端零 LLM 成本。
 
 **提醒有效性自适应(v0.5)**:每次提醒发出 10 次调用后,结算它是否改变了行为(出现修改/失败停止/命令模式变化),再按各类提醒的历史有效率自动调整冷却——无效的降噪(冷却翻倍),有效的加强(冷却缩到 3/4)。dsh 端统计随宿主进程存续,ZCode 端持久化到 `adaptive.json`。
 
@@ -80,23 +90,28 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 
 全部参数见 `/lookup-config`。
 
-## 双端能力差异(ZCode vs dsh)
+## 各宿主能力差异(ZCode / dsh / WorkBuddy)
 
-两个宿主共用同一套检测逻辑(阈值来自仓库根 `spec.json`,由 `test/golden_check.py` 与
+三个宿主共用同一套检测逻辑(阈值来自仓库根 `spec.json`,由 `test/golden_check.py` 与
 `test/golden.mjs` 双端金标测试钉住),但加载机制与配置面不同,**按宿主区分配置**:
 
-| 能力 | ZCode (Python hook) | DeepSeek Harness (JS bundle) |
-|---|---|---|
-| 触发检测(重复/失败/零产出/折返) | ✅ | ✅ |
-| 本地时钟锚点 | ✅ | ✅ |
-| 独立审查者 | 需配 `llm_api_key`(默认关) | 复用会话 `llm` 服务(默认开) |
-| 第三通道(独立 watcher) | ✅ 由 `hooks/lookup_watcher.py` 承担(自带 key,需显式开 `deliver_review`) | ✅ 同一套目录协议,钩子侧投递/取回已实现;watcher 进程复用同一脚本 |
-| 配置键命名 | `snake_case`(`llm_review`) | `camelCase`(`llmReview`) |
-| `llm_api_base` / `llm_model` / `llm_timeout_sec` | ✅ 生效 | ❌ 不读取;审查者模型跟随会话,如需换模型请在会话层设置 |
-| 状态持久化 | 落盘 `%TEMP%/zcode-ai-look-up/`(带跨进程锁) | 会话状态在内存,**宿主重启即丢状态**;第三通道的请求/结论仍落同一目录 |
+| 能力 | ZCode (Python hook) | DeepSeek Harness (JS bundle) | WorkBuddy / CodeBuddy CLI (Python hook) |
+|---|---|---|---|
+| 接入配置落点 | 插件自带 `hooks/hooks.json`,无需额外配置 | `package.json` 的 `dsh.bundle.patch` | `~/.codebuddy/settings.json` 的 `hooks`(或项目 `.codebuddy/settings.json`),经 `adapters/workbuddy/` shim |
+| 触发检测(重复/失败/零产出/折返) | ✅ | ✅ | ✅ |
+| 失败事件来源 | 原生 `PostToolUseFailure` | 原生 | 原生 `PostToolUseFailure` |
+| 本地时钟锚点 | ✅ | ✅ | ✅ |
+| 独立审查者 | 需配 `llm_api_key`(默认关) | 复用会话 `llm` 服务(默认开) | 需配 `llm_api_key`(默认关),同 ZCode |
+| 第三通道(独立 watcher) | ✅ 由 `hooks/lookup_watcher.py` 承担(自带 key,需显式开 `deliver_review`) | ✅ 同一套目录协议,钩子侧投递/取回已实现;watcher 进程复用同一脚本 | ✅ 同 ZCode,复用同一份 `lookup_watcher.py` |
+| 配置键命名 | `snake_case`(`llm_review`) | `camelCase`(`llmReview`) | `snake_case`(`llm_review`) |
+| `llm_api_base` / `llm_model` / `llm_timeout_sec` | ✅ 生效 | ❌ 不读取;审查者模型跟随会话,如需换模型请在会话层设置 | ✅ 生效 |
+| 状态持久化 | 落盘 `%TEMP%/zcode-ai-look-up/`(带跨进程锁) | 会话状态在内存,**宿主重启即丢状态**;第三通道的请求/结论仍落同一目录 | 落盘 `%TEMP%/zcode-ai-look-up/`(带跨进程锁) |
 
-> ⚠️ `llm_api_key` / `llm_api_base` / `llm_model` / `llm_timeout_sec` 只在 ZCode(Python)
-> 端被读取;dsh 用户配置它们不会生效也不会报错。
+> ⚠️ `llm_api_key` / `llm_api_base` / `llm_model` / `llm_timeout_sec` 只在 Python 端
+> (ZCode / WorkBuddy)被读取;dsh 用户配置它们不会生效也不会报错。
+>
+> ⚠️ WorkBuddy 对 Stop 钩子的 `{"decision":"block"}` 仍识别但已标 deprecated,
+> `adapters/workbuddy/` 的 shim 会同时补一份 `hookSpecificOutput.additionalContext`,双通道保底。
 
 ## 行为规格与跨宿主适配
 
@@ -108,8 +123,9 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 - **`test/channel_check.py`**(第三通道端到端)与 **`test/revert_verify.py`**(反向验证:
   把每条修复改回缺陷形态,确认对应测试确实变红)是 v0.7 新增的两道自检——后者用来
   证明防线不是装饰性的。
-- **`adapters/`** 提供其他钩子型宿主(Claude Code / OpenCode / Gemini CLI)的实验性
+- **`adapters/`** 提供其他钩子型宿主(WorkBuddy / Claude Code / OpenCode / Gemini CLI)的
   适配 shim——适配层只做事件与字段映射,不复制逻辑,详见 `adapters/README.md`。
+  WorkBuddy 适配已真机验证,其余为实验性脚手架。
 
 ## 状态与调试
 
