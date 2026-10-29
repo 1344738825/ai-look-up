@@ -48,6 +48,14 @@ WorkBuddy 的 hook 协议与 Claude Code 同形，payload 字段同名
 
 四条命令完全一样：shim 读 stdin 的 `hook_event_name` 自动判定动作，不需要传参。
 
+改完配置需要**新开会话**（或重启客户端）才生效——hooks 在会话启动时加载。
+
+### Stop 的 decision 字段
+
+WorkBuddy 仍识别 `{"decision":"block","reason":...}`，但源码里已标 deprecated
+（日志会告警 "Hook uses deprecated decision field"）。shim 在 Stop 动作上会自动补一份
+`hookSpecificOutput.additionalContext`，两条路径同时给，任一被消费即生效，不必等上游改。
+
 ### 两个 Windows 坑
 
 1. **路径用正斜杠**。hook 命令经 `bash -c` 执行，`C:\path\python.exe` 里的反斜杠会被

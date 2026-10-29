@@ -81,6 +81,26 @@ def build_payload(data):
     return payload
 
 
+def normalize_output(action, raw):
+    """核心输出原样透传，但 Stop 的 `{"decision":"block"}` 在 WorkBuddy 里是
+    deprecated 字段（仍被识别，日志会告警）。Stop 时额外补一份
+    hookSpecificOutput.additionalContext，两条路径任一被消费即可生效。
+    """
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return raw
+    if not isinstance(obj, dict):
+        return raw
+    if action == "stop" and obj.get("decision") == "block":
+        reason = obj.get("reason") or ""
+        hso = obj.setdefault("hookSpecificOutput", {})
+        if isinstance(hso, dict) and reason:
+            hso.setdefault("hookEventName", "Stop")
+            hso.setdefault("additionalContext", reason)
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8")
+
+
 def main():
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -104,7 +124,7 @@ def main():
             timeout=30,
         )
         if proc.stdout:
-            sys.stdout.buffer.write(proc.stdout)
+            sys.stdout.buffer.write(normalize_output(action, proc.stdout))
             sys.stdout.buffer.flush()
     except Exception:
         pass
