@@ -20,11 +20,25 @@ DeepSeek Harness 的插件页支持直接粘贴 Git 仓库地址安装——本�
 
 **方式三:WorkBuddy / CodeBuddy CLI(手动配 hooks)**
 
-WorkBuddy 没有可安装的插件市场入口,直接改配置文件:在 `~/.codebuddy/settings.json`
-(或项目级 `<项目>/.codebuddy/settings.json`)的 `hooks` 键里注册四个事件,命令统一指向
+WorkBuddy 没有可安装的插件市场入口,直接改配置文件。**注意两个客户端读的配置目录不同**,写错
+位置不会报错、也永远不会触发:
+
+| 客户端 | 配置文件 |
+|---|---|
+| WorkBuddy 桌面端 | `~/.workbuddy/settings.json` |
+| CodeBuddy CLI | `~/.codebuddy/settings.json` |
+
+在对应文件的 `hooks` 键里注册四个事件,命令统一指向
 `adapters/workbuddy/lookup_wb_adapter.py`——shim 按 stdin 的 `hook_event_name` 自动判定动作。
-改完需新开会话才加载。完整片段与两个 Windows 坑(路径必须正斜杠、python 必须绝对路径)
-见 `adapters/workbuddy/README.md`。
+
+一条命令搞定(自动探测 python 绝对路径、合并写入、跑自检):
+
+```bash
+python adapters/workbuddy/install.py            # 自动识别已装的客户端,可 --client workbuddy|codebuddy
+```
+
+也可按 `adapters/workbuddy/README.md` 里的片段手改。完整片段与两个 Windows 坑
+(路径必须正斜杠、python 必须绝对路径)见同一文件。
 
 **要求:** ZCode 安装方式需要系统可用 `python` 命令(3.8+),若可执行名不同,修改 `hooks/hooks.json` 中的 4 处 `python` 即可;WorkBuddy 方式同上,且因为 hook 经 `bash -c` 执行,建议直接写 python 绝对路径;dsh 安装方式无此要求(纯 JS)。
 

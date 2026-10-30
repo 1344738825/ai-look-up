@@ -20,8 +20,28 @@ WorkBuddy 的 hook 协议与 Claude Code 同形，payload 字段同名
 
 ## 配置
 
-写在用户级 `~/.codebuddy/settings.json`（全局生效），或项目级
-`<项目>/.codebuddy/settings.json`（只对该项目生效）。两者格式相同：
+**先确认你在配哪个客户端——两者配置文件不同,写错不报错、钩子永不触发:**
+
+| 客户端 | 用户级配置 |
+|---|---|
+| WorkBuddy 桌面端 | `~/.workbuddy/settings.json` |
+| CodeBuddy CLI | `~/.codebuddy/settings.json` |
+
+用户级（全局生效）写在对应文件；项目级按同目录规则（`<项目>/.workbuddy/settings.json`
+或 `<项目>/.codebuddy/settings.json`，未逐一实测，以用户级为准）。格式相同：
+
+推荐直接跑安装脚本，避免手改路径出错：
+
+```bash
+python adapters/workbuddy/install.py                     # 自动识别已装客户端
+python adapters/workbuddy/install.py --client workbuddy  # 强制指定
+python adapters/workbuddy/install.py --all               # 两个都配
+```
+
+脚本会：探测 python 绝对路径 → 备份已有配置 → 按顶层键合并 `hooks`（不覆盖其他键）
+→ 用假 payload 跑一次 shim 自检 → 打印 `✅/❌`。
+
+手改则原样抄下面这段：
 
 ```json
 {
@@ -48,7 +68,9 @@ WorkBuddy 的 hook 协议与 Claude Code 同形，payload 字段同名
 
 四条命令完全一样：shim 读 stdin 的 `hook_event_name` 自动判定动作，不需要传参。
 
-改完配置需要**新开会话**（或重启客户端）才生效——hooks 在会话启动时加载。
+改完配置通常**热生效**——实测(WorkBuddy 5.9.x, 2026-10-31)在写入后同会话内 7 秒即触发，
+无需重启。若下一次工具调用后状态文件仍未刷新，再新开会话/重启客户端（hooks 也可能在会话
+启动时缓存）。
 
 ### Stop 的 decision 字段
 
