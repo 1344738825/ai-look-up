@@ -28,6 +28,7 @@ ai-look-up —— AI 抬头钩子(核心检测脚本)
 import hashlib
 import json
 import os
+import random
 import re
 import sys
 import tempfile
@@ -591,24 +592,45 @@ def load_state(sid, now):
     return state
 
 
-def save_state(sid, state):
+def _warn(msg):
+    """异常路径的诊断出口：一律走 stderr，不污染 hook 的 stdout 协议。"""
     try:
-        tmp = state_path(sid) + ".tmp"
+        sys.stderr.write("[lookup] %s\n" % msg)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def save_state(sid, state):
+    """原子落盘。Windows 上 os.replace 会撞并发句柄的共享冲突，必须重试到
+    真的写进去为止——旧实现 3 次失败就 `return`，等于静默丢一次状态更新：
+    CI 上只表现为「计数少 1」，现场什么都没留下。
+    """
+    tmp = None
+    try:
+        target = state_path(sid)
+        # 每进程独立临时名：无锁降级路径下两个进程不会互相踩同一个 .tmp。
+        tmp = "%s.tmp.%d.%s" % (target, os.getpid(), uuid.uuid4().hex[:8])
         data = json.dumps(state, ensure_ascii=False, indent=1)
-        for attempt in range(3):
+        last = None
+        for attempt in range(6):
             try:
                 with open(tmp, "w", encoding="utf-8") as f:
                     f.write(data)
-                os.replace(tmp, state_path(sid))
+                os.replace(tmp, target)
                 return
+            except OSError as e:
+                last = e
+                time.sleep(min(0.3, 0.02 * (2 ** attempt)))
+        _warn("save_state: 重试 6 次仍写不进 %s（本次更新丢失）: %r" % (target, last))
+    except Exception as e:
+        _warn("save_state: 异常 %r" % (e,))
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
             except OSError:
-                # Windows 上 replace 可能撞上并发读句柄的共享冲突；
-                # 静默放弃 = 直接丢一次状态更新，重试几次再放弃。
-                if attempt == 2:
-                    return
-                time.sleep(0.05 * (attempt + 1))
-    except Exception:
-        pass
+                pass
 
 
 def _pid_alive(pid):
@@ -641,25 +663,23 @@ class state_lock(object):
     P2-1：钩子是独立短命进程，多个事件可能并发落到同一 <sid>.json；
     没有锁时后写的会整体覆盖先写的（实测 20 并发只保住 7~9 次记录）。
 
-    设计要点（避开 Windows 上踩过的坑）：
-      * 锁内容 = `pid:token`，token 为本次获取的随机串。释放时校验 token——
-        只删自己的锁，绝不误删别人重新抢到的锁。
-      * 接管失效锁用 **rename**（原子），不用 os.remove——
-        直接 remove 可能删掉「刚被别人抢到的新锁」，造成双持有者。
-      * 接管判据 = PID 已死 **或** 锁文件心跳超过 stale_after 秒（见下）。
+    设计要点：
+      * 锁文件**常驻**，互斥由 OS 锁提供：Windows 用 msvcrt 字节锁，
+        POSIX 用 flock。持锁期间句柄一直打开，进程退出/崩溃由内核自动释放。
+      * 不再 create/remove/rename 锁文件：那套方案在 Windows 上会被等待者的
+        读句柄卡住 DeleteFile（锁泄漏），stale rename 又有把活锁抢走的窗口。
+        CI windows 的 20 并发偶发丢更新正是这两处叠加。
+      * 锁内容 = `pid:token` 仅用于心跳归属判断和诊断，不承担互斥。
       * 有界等待：拿不到锁最多等 wait 秒就放行，绝不卡住会话（可用性优先）。
 
-    ★ v0.8 心跳：以前接管只看「文件 mtime 是否过期」，可 mtime 只有创建时被写一次，
-    于是它实际等于"锁创建了多久"而非"持锁者还活着多久"。两个后果：
-      - **POSIX 上 `os.kill(pid, 0)` 对 zombie 进程返回成功** → `_pid_alive` 判活，
-        僵尸锁无人接管（要等 STALE_AFTER 兜底）；
-      - 反之若临界区真比 STALE_AFTER 长（大状态文件 + 慢盘），活锁会被误接管 → 双持有者。
-    现在持锁者起一个心跳线程定期 touch mtime，`STALE_AFTER` 才真正表示
-    "持锁者最近一次动静在 N 秒前"，两个方向都准。
+    ★ v0.8 心跳：持锁者定期重写 token 刷新 mtime。若超过 STALE_AFTER 没有
+    心跳，保留旧语义允许超时接管（防 holder 假死）；正常并发由 OS 锁互斥，
+    不会走到这条路径。
     """
 
     STALE_AFTER = 15.0     # 心跳超过这么久没更新，即可安全接管
     HEARTBEAT_SEC = 5.0    # 心跳间隔（须显著小于 STALE_AFTER，留冗余）
+    LOCK_OFFSET = 1024     # Windows 字节锁避开 token 区，等待者仍能读 token
 
     def __init__(self, sid, wait=None):
         self.path = state_path(sid) + ".lock"
@@ -671,6 +691,8 @@ class state_lock(object):
         self.wait = wait
         self.token = "%d:%s" % (os.getpid(), uuid.uuid4().hex)
         self.acquired = False
+        self.degraded = False     # True = 超时后无锁执行（会丢更新，仅保可用性）
+        self._fd = None           # 持锁期间保持打开；进程死亡由内核释放锁
         self._hb_stop = threading.Event()
         self._hb_thread = None
 
@@ -681,18 +703,28 @@ class state_lock(object):
         except Exception:
             return ""
 
+    def _write_owner(self):
+        """经自己的句柄写 token；写操作同时刷新 mtime，兼作心跳。"""
+        if self._fd is None:
+            return
+        try:
+            os.lseek(self._fd, 0, os.SEEK_SET)
+            os.ftruncate(self._fd, 0)
+            os.write(self._fd, self.token.encode("ascii"))
+            # Windows/NTFS 会缓存 mtime 到句柄关闭；flush 后等待者才能看到心跳。
+            os.fsync(self._fd)
+        except OSError:
+            pass
+
     def heartbeat(self):
         """刷新锁文件 mtime，告诉等待者"我还活着"。只在自己仍持有锁时刷。"""
         if not self.acquired:
             return
-        # 只在 token 仍属自己时 touch，避免给"已被接管的新锁"续命。
+        # 被超时接管后 token 已换代，不能给新持有者的锁续命。
+        # 不永久停线程：若只是读到写入中的空内容，下一轮还能恢复。
         if self._holder_token() != self.token:
-            self._hb_stop.set()
             return
-        try:
-            os.utime(self.path, None)
-        except OSError:
-            pass
+        self._write_owner()
 
     def _start_heartbeat(self):
         def _loop():
@@ -713,65 +745,74 @@ class state_lock(object):
                 pass
             self._hb_thread = None
 
-    def _is_stale(self, raw):
-        """锁是否已失效：PID 已死，或心跳久未更新（兜住 PID 复用/zombie）。"""
+    def _try_os_lock(self):
+        """对持久锁文件加 OS 锁。进程退出/崩溃时由内核自动释放。"""
+        if self._fd is None:
+            self._fd = os.open(self.path, os.O_CREAT | os.O_RDWR |
+                               getattr(os, "O_BINARY", 0))
+        os.lseek(self._fd, self.LOCK_OFFSET, os.SEEK_SET)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(self._fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def _is_stale(self):
+        """只有心跳超时才算失效；进程死亡由 OS 锁自动释放，不靠 PID 猜测。"""
         try:
-            age = time.time() - os.path.getmtime(self.path)
+            return time.time() - os.path.getmtime(self.path) > self.STALE_AFTER
         except OSError:
-            return True
-        if age > self.STALE_AFTER:
-            return True
-        pid = 0
-        try:
-            pid = int(raw.split(":", 1)[0] or "0")
-        except Exception:
-            pid = 0
-        return not _pid_alive(pid)
+            return False
+
+    def _degrade(self, why):
+        """超时降级：不卡会话（可用性优先），但必须留痕。"""
+        self.degraded = True
+        if self.wait >= 5.0 or os.environ.get("LOOKUP_LOCK_DEBUG"):
+            _warn("state_lock: %s（wait=%.1fs），降级为无锁执行" % (why, self.wait))
+        return self
 
     def __enter__(self):
         deadline = time.time() + max(0.0, self.wait)
         while True:
             try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                os.write(fd, self.token.encode("ascii"))
-                os.close(fd)
+                self._try_os_lock()
                 self.acquired = True
+                self._write_owner()
                 self._start_heartbeat()      # ★ v0.8：持锁期间持续刷 mtime
                 return self
-            except FileExistsError:
-                raw = self._holder_token()
-                if raw and self._is_stale(raw):
-                    # 原子接管：rename 到本进程专属名，只有一方能成功，
-                    # 且只对「刚才那个失效锁」生效，不会误伤新持有者。
-                    grab = "%s.stale.%d.%s" % (self.path, os.getpid(), uuid.uuid4().hex[:8])
-                    try:
-                        os.rename(self.path, grab)
-                        try:
-                            os.remove(grab)
-                        except OSError:
-                            pass
-                    except OSError:
-                        pass          # 已被别人接管或已释放，下一轮重试
-                    continue
-                if time.time() >= deadline:
-                    return self      # 超时：不阻塞会话，降级为无锁执行
-                time.sleep(0.02)
             except OSError:
-                # 非 EEXIST 的瞬时错误（Windows 共享冲突/杀软扫描等）：
-                # 等在 deadline 内重试而不是立刻降级为无锁——无锁执行
-                # 会造成并发写互相覆盖（P2-1 的丢更新）。超时才放行保可用性。
-                if time.time() >= deadline:
+                if self._is_stale():
+                    # 保留 v0.8 语义：持锁者超过 STALE_AFTER 没心跳，允许接管。
+                    # 正常并发永远走不到这里（OS 锁已互斥，进程死亡自动解锁）。
+                    self.acquired = True
+                    self._write_owner()
+                    self._start_heartbeat()  # 接管者也要续心跳
                     return self
-                time.sleep(0.02)
+                if time.time() >= deadline:
+                    return self._degrade("等待超时")
+                # 抖动退避，避免所有等待者同相位敲打慢盘/杀软。
+                time.sleep(0.02 + random.uniform(0.0, 0.03))
 
     def __exit__(self, *exc):
         if not self.acquired:
             return False
         self._stop_heartbeat()               # ★ v0.8：先停心跳，再删锁
-        # 只删自己的锁：token 不匹配说明锁已被接管/重抢，绝不能动别人的。
-        if self._holder_token() == self.token:
+        fd, self._fd = self._fd, None
+        if fd is not None:
             try:
-                os.remove(self.path)
+                os.lseek(fd, self.LOCK_OFFSET, os.SEEK_SET)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                # 被 stale 接管的路径本来就没拿到 OS 锁；关句柄即可。
+                pass
+            try:
+                os.close(fd)
             except OSError:
                 pass
         return False
