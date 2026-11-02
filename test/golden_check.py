@@ -595,6 +595,19 @@ def _p_request_poll_sec(pv):
         W.load_spec, _t.sleep, W.load_cfg = orig
 
 
+def _p_lessons_ttl_days(ttl):
+    """同一份 8 天前的坑位:TTL=ttl 时不再注入,TTL=0 时仍注入 —— 双向锚定。"""
+    import time as _t
+    now = _t.time()
+    stale = [{"pattern": "python ttl_probe.py", "correction": "c", "hits": 9,
+              "last_seen": now - 8 * 86400}]
+    with open(lk.lessons_path(), "w", encoding="utf-8") as f:
+        json.dump(stale, f)
+    with_ttl = lk.lessons_text({"prompt_resets": 1}, _cfg(lessons_ttl_days=ttl))
+    no_ttl = lk.lessons_text({"prompt_resets": 1}, _cfg(lessons_ttl_days=0))
+    return (with_ttl is None, no_ttl is not None and "ttl_probe" in no_ttl)
+
+
 # 每键一条行为断言，形式为 (探针, 锚定期望, 说明)：
 #   探针()      -> 观测值
 #   期望(观测值) -> 该观测值是否符合"键按文档语义生效"的**正向**预期
@@ -673,6 +686,8 @@ BEHAVIOR_KEYS = {
                                  _eq(1), "门槛 3(reminders 到 3) → 投递 1 件请求"),
     "request_poll_sec": (lambda: _p_request_poll_sec(7),
                          _eq(7), "spec 轮询 7s → run_loop 睡 7s"),
+    "lessons_ttl_days": (lambda: _p_lessons_ttl_days(7),
+                         _eq((True, True)), "TTL 7 天:8 天前的坑位不再注入;TTL=0 永不过期仍注入"),
 }
 
 # 这些键的行为断言由 test/channel_check.py 覆盖（第三通道端到端），

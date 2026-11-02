@@ -27,6 +27,10 @@ jobs:
         run: python test/golden_check.py
         env:
           PYTHONUNBUFFERED: "1"
+      - name: lessons TTL
+        run: python test/lessons_ttl_check.py
+        env:
+          PYTHONUNBUFFERED: "1"
       - name: third-channel end-to-end
         run: python test/channel_check.py
         env:

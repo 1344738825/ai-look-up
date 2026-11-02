@@ -607,4 +607,32 @@ const texts = (agent) =>
   console.log('PASS  activation survives a ctx whose llm getter throws (cordis semantics)');
 }
 
+// 23) lesson TTL:坑位超期未被再次踩到,新 agent 不得再收到注入
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  for (let i = 0; i < 3; i++) {
+    emit('tools/result', exec(agent, 'Bash', { command: 'python stale_probe.py' }), { isError: true });
+  }
+  const rookie = makeAgent();
+  emit('agent/created', rookie);
+  assert(texts(rookie).some((t) => t.includes('已知坑位') && t.includes('stale_probe')),
+    'fresh lesson must reach a newly created agent');
+  // 把时钟拨到 8 天后(默认 TTL 7 天):同一坑位应过期,注入退场
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() + 8 * 86400000;
+    const veteran = makeAgent();
+    emit('agent/created', veteran);
+    assert(!texts(veteran).some((t) => t.includes('stale_probe')),
+      'expired lesson must be dropped for new agents');
+    assert(!texts(veteran).some((t) => t.includes('已知坑位')),
+      'no lessons block at all when every lesson is expired');
+  } finally {
+    Date.now = realNow;
+  }
+  console.log('PASS  lesson TTL drops pitfalls not re-hit within the window');
+}
+
 console.log('ALL DSH SMOKE TESTS PASSED');

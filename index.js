@@ -58,6 +58,7 @@ const KEY_MAP = {
   adaptive_tighten_floor_sec: 'adaptiveTightenFloorSec',
   drift_check_calls: 'driftCheckCalls',
   drift_cooldown_sec: 'driftCooldownSec',
+  lessons_ttl_days: 'lessonsTtlDays',
   escalate_after_reminders: 'escalateAfterReminders',
   request_poll_sec: 'requestPollSec',
   request_ttl_sec: 'requestTtlSec',
@@ -117,6 +118,9 @@ const DEFAULTS = {
   driftCooldownSec: 900,
   // lesson ledger (v0.5): failures register pitfalls, new agents get the top ones
   lessons: true,
+  // lesson TTL (v0.8.4): pitfalls not re-hit within N days are dropped; 0 = keep forever.
+  // Without it, dev-time test data occupies injection slots forever by hits ranking.
+  lessonsTtlDays: 7,
   // ── 第三通道:投递请求 + 独立 watcher（v0.7）──
   // deliverReview 默认关:它要花用户自己的 API 额度,只有显式开启才投递。
   deliverReview: false,
@@ -166,18 +170,25 @@ const lessonsLedger = new Map();
 
 function registerLesson(pattern, correction) {
   if (!pattern) return;
+  const now = Date.now();
   const prev = lessonsLedger.get(pattern);
   if (prev) {
     prev.hits += 1;
     prev.correction = correction;
+    prev.lastSeen = now;
   } else {
-    lessonsLedger.set(pattern, { pattern, correction, hits: 1 });
+    lessonsLedger.set(pattern, { pattern, correction, hits: 1, lastSeen: now });
   }
 }
 
-function lessonsMessage(state, force = false) {
+function lessonsMessage(state, force = false, cfg = null) {
   if (!lessonsLedger.size) return null;
-  const top = [...lessonsLedger.values()].sort((a, b) => b.hits - a.hits).slice(0, 3);
+  // TTL: pitfalls not re-hit within lessonsTtlDays are dropped (0 = keep forever)
+  const ttlDays = (cfg && cfg.lessonsTtlDays) || 0;
+  const deadline = ttlDays > 0 ? Date.now() - ttlDays * 86400000 : 0;
+  const alive = [...lessonsLedger.values()].filter((e) => !deadline || (e.lastSeen || 0) >= deadline);
+  if (!alive.length) return null;
+  const top = alive.sort((a, b) => b.hits - a.hits).slice(0, 3);
   const sig = top.map((e) => e.pattern + 'x' + e.hits).join('|');
   if (state.lessonsSig === sig && !force) return null;
   state.lessonsSig = sig;
@@ -798,7 +809,7 @@ export function apply(ctx, config) {
   ctx.on('agent/created', (agent) => {
     state.set(agent, freshState());
     if (cfg.lessons) {
-      const known = lessonsMessage(stateOf(agent));
+      const known = lessonsMessage(stateOf(agent), false, cfg);
       if (known) deliver(agent, ctx, known);
     }
     try {
@@ -834,7 +845,7 @@ export function apply(ctx, config) {
         } catch { /* goal capture is best-effort */ }
         // 会话中途注册的坑位也要有投递点:每 5 个回合强制重注一次
         if (cfg.lessons) {
-          const known = lessonsMessage(st, st.promptResets % 5 === 0);
+          const known = lessonsMessage(st, st.promptResets % 5 === 0, cfg);
           if (known) deliver(agent, ctx, known);
         }
         return;

@@ -114,6 +114,9 @@ DEFAULTS = {
     "drift_cooldown_sec": 900,
     # 教训登记簿:失败循环自动登记坑位,回合开始时注入 Top 教训,防"认坑后再踩"
     "lessons": True,
+    # 坑位 TTL:超过 N 天未被再次踩到的坑位自动淘汰(0=永不淘汰)。
+    # 没有它,开发期的测试数据会按 hits 排序永久占据注入名额。
+    "lessons_ttl_days": 7,
     # ── 第三通道:投递请求 + 独立 watcher（v0.7）──
     # 钩子只写请求单就返回（不阻塞），常驻 watcher 用自己的 key 去审，结论回投后
     # 由下一次钩子事件捎带注入。主 agent 全程不在链路上 → 独立性最强。
@@ -374,8 +377,18 @@ def lessons_path():
     return os.path.join(state_dir(), "lessons.json")
 
 
-def register_lesson(pattern, correction):
-    """登记/累加一条坑位教训;同模式合并,hits 记录被踩次数。"""
+def _lessons_alive(lessons, ttl_days):
+    """按 TTL 过滤掉过期的坑位;last_seen 缺失/损坏的条目视为过期。"""
+    if ttl_days <= 0:
+        return [e for e in lessons if isinstance(e, dict)]
+    deadline = time.time() - ttl_days * 86400
+    return [e for e in lessons
+            if isinstance(e, dict) and e.get("last_seen", 0) >= deadline]
+
+
+def register_lesson(pattern, correction, cfg=None):
+    """登记/累加一条坑位教训;同模式合并,hits 记录被踩次数。
+    写入时顺带按 TTL 淘汰过期坑位,账本不会只增不减。"""
     if not pattern:
         return
     try:
@@ -384,6 +397,7 @@ def register_lesson(pattern, correction):
         lessons = lessons if isinstance(lessons, list) else []
     except Exception:
         lessons = []
+    lessons = _lessons_alive(lessons, (cfg or {}).get("lessons_ttl_days", 0))
     for entry in lessons:
         if entry.get("pattern") == pattern:
             entry["hits"] = entry.get("hits", 1) + 1
@@ -401,17 +415,19 @@ def register_lesson(pattern, correction):
         pass
 
 
-def top_lessons(n=3):
+def top_lessons(n=3, cfg=None):
     try:
         with open(lessons_path(), encoding="utf-8") as f:
             lessons = json.load(f)
-        return [e for e in lessons if isinstance(e, dict)][:n]
+        alive = _lessons_alive(lessons if isinstance(lessons, list) else [],
+                               (cfg or {}).get("lessons_ttl_days", 0))
+        return alive[:n]
     except Exception:
         return []
 
 
-def lessons_text(state):
-    lessons = top_lessons(3)
+def lessons_text(state, cfg=None):
+    lessons = top_lessons(3, cfg)
     if not lessons:
         return None
     # 内容没变就不重复注入(每 5 个回合强制重注一次,防上下文压缩后丢失)
@@ -1321,7 +1337,8 @@ def handle_post_fail(cfg, data, state, now):
         if last_fail:
             register_lesson(
                 norm_cmd(last_fail.get("brief", "")) or "未知模式",
-                "连续失败 {n} 次后被打断——换方法前请先读错误定位根因,勿重复此方式".format(n=streak))
+                "连续失败 {n} 次后被打断——换方法前请先读错误定位根因,勿重复此方式".format(n=streak),
+                cfg)
     return post_fail_output(finalize_text(
         state, cfg, now, "fail-loop",
         "连续失败 {n} 次".format(n=streak),
@@ -1338,7 +1355,7 @@ def handle_prompt(cfg, data, state, now):
         state["last_goal"] = goal.strip()[:400]
     # 回合开始即注入历史教训,防"认坑后再踩"(内容未变则跳过,每 5 回合强制重注)
     if cfg.get("lessons"):
-        lt = lessons_text(state)
+        lt = lessons_text(state, cfg)
         if lt:
             return {
                 "hookSpecificOutput": {

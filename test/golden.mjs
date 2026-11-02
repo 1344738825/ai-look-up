@@ -48,6 +48,7 @@ const KEY_MAP = {
   adaptive_tighten_floor_sec: 'adaptiveTightenFloorSec',
   drift_check_calls: 'driftCheckCalls',
   drift_cooldown_sec: 'driftCooldownSec',
+  lessons_ttl_days: 'lessonsTtlDays',
   escalate_after_reminders: 'escalateAfterReminders',
   request_poll_sec: 'requestPollSec',
   request_ttl_sec: 'requestTtlSec',

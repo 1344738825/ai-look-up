@@ -40,6 +40,7 @@ argument-hint: "[要调整的参数=新值, 或留空查看]"
 | `drift_check_calls` | `30` | 每 N 次调用巡检一次 |
 | `drift_cooldown_sec` | `900` | 巡检冷却(秒) |
 | `lessons` | `true` | 教训登记簿:失败登记坑位,回合开始注入 Top 3 |
+| `lessons_ttl_days` | `7` | 坑位超过 N 天未被再次踩到即自动淘汰;`0` = 永不淘汰 |
 | `llm_review` | `false` | 触发提醒时用独立 LLM 上下文审查是否空跑 |
 | `llm_api_base` | `https://api.deepseek.com` | OpenAI 兼容接口地址 |
 | `llm_api_key` | 空 | 接口密钥,填写后审查才生效 |
