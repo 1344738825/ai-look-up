@@ -49,6 +49,9 @@ const KEY_MAP = {
   drift_check_calls: 'driftCheckCalls',
   drift_cooldown_sec: 'driftCooldownSec',
   lessons_ttl_days: 'lessonsTtlDays',
+  round_replan_rounds: 'roundReplanRounds',
+  round_replan_min_calls: 'roundReplanMinCalls',
+  step_replan_calls: 'stepReplanCalls',
   escalate_after_reminders: 'escalateAfterReminders',
   request_poll_sec: 'requestPollSec',
   request_ttl_sec: 'requestTtlSec',
@@ -438,6 +441,55 @@ check('behavior driftCheckCalls/driftCooldownSec（巡检间隔触发 + 冷却�
   for (let i = 0; i < 8; i++) a.call('Read', { file_path: 'a' });
   assert.equal(a.st().driftChecks, 1, '间隔 3 首次巡检后,1 小时冷却内应只巡检 1 次');
   assert.equal(a.st().callsAtLastDrift, 3, '巡检按 calls(第 3 次)触发');
+});
+
+// 轮次里程碑(v0.9):回合/步数两条计数线,阈值双向锚定(写死常量必露馅)。
+const MILESTONE_BASE = { clockTick: false, lessons: false, llmReview: false, adaptive: false,
+  driftCheck: false, cooldownSec: 0, failCooldownSec: 0 };
+
+check('behavior roundReplanRounds（阈值 3：前 2 回合静默、第 3 回合触发）', () => {
+  const a = mkAgent({ ...MILESTONE_BASE, roundReplanRounds: 3, roundReplanMinCalls: 0,
+    stepReplanCalls: 999 });
+  a.msg();
+  a.msg();
+  assert.equal(markerCount(a.agent, '轮次里程碑'), 0, '前 2 个回合应静默');
+  a.msg();
+  assert.ok(markerCount(a.agent, '轮次里程碑') > 0, '第 3 个回合应触发');
+});
+
+check('behavior roundReplanMinCalls（下限 5：步数不足静默、补足后触发）', () => {
+  const a = mkAgent({ ...MILESTONE_BASE, roundReplanRounds: 2, roundReplanMinCalls: 5,
+    stepReplanCalls: 999 });
+  a.msg();
+  a.msg();
+  assert.equal(markerCount(a.agent, '轮次里程碑'), 0, '回合数够但 0 次调用 → 静默');
+  for (let i = 0; i < 5; i++) a.call('Read', { file_path: 'f' + i });
+  a.msg();
+  assert.ok(markerCount(a.agent, '轮次里程碑') > 0, '步数补足后第 3 个回合应触发');
+});
+
+check('behavior stepReplanCalls（阈值 3：第 2 次静默、第 3 次触发）', () => {
+  const a = mkAgent({ ...MILESTONE_BASE, roundReplanRounds: 999, stepReplanCalls: 3,
+    callNudgeInterval: 999 });
+  a.call('Read', { file_path: 'a' });
+  a.call('Read', { file_path: 'b' });
+  assert.equal(markerCount(a.agent, '轮次里程碑'), 0, '前 2 次调用应静默');
+  a.call('Read', { file_path: 'c' });
+  assert.ok(markerCount(a.agent, '轮次里程碑') > 0, '第 3 次调用应触发');
+});
+
+check('behavior showToUser（开启 → 提醒含呈报指令;关闭 → 不含且提醒照常）', () => {
+  const withReport = mkAgent({ ...MILESTONE_BASE, roundReplanRounds: 2,
+    roundReplanMinCalls: 0, stepReplanCalls: 999 });
+  withReport.msg();
+  withReport.msg();
+  assert.ok(markerCount(withReport.agent, '呈报') > 0, '默认开启时里程碑应含呈报指令');
+  const silent = mkAgent({ ...MILESTONE_BASE, showToUser: false, roundReplanRounds: 2,
+    roundReplanMinCalls: 0, stepReplanCalls: 999 });
+  silent.msg();
+  silent.msg();
+  assert.equal(markerCount(silent.agent, '呈报'), 0, '关闭后不应含呈报指令');
+  assert.ok(markerCount(silent.agent, '轮次里程碑') > 0, '关闭呈报不影响提醒本身');
 });
 
 check('behavior requestTtlSec/resultTtlSec/resultSettleCalls（第三通道三闸，JS 端）', () => {

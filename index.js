@@ -59,6 +59,9 @@ const KEY_MAP = {
   drift_check_calls: 'driftCheckCalls',
   drift_cooldown_sec: 'driftCooldownSec',
   lessons_ttl_days: 'lessonsTtlDays',
+  round_replan_rounds: 'roundReplanRounds',
+  round_replan_min_calls: 'roundReplanMinCalls',
+  step_replan_calls: 'stepReplanCalls',
   escalate_after_reminders: 'escalateAfterReminders',
   request_poll_sec: 'requestPollSec',
   request_ttl_sec: 'requestTtlSec',
@@ -116,6 +119,22 @@ const DEFAULTS = {
   driftCheck: true,
   driftCheckCalls: 30,
   driftCooldownSec: 900,
+  // ── 轮次里程碑·强制全局重规划提醒(v0.9)──
+  // 与负向触发器互补:负向只报"故障",健康地钻牛角尖(每步有新信息、偶尔改文件)
+  // 永远不会命中。里程碑不看行为好坏,到点强制抬头。有意不走 fire():不计升级
+  // 阶梯、不占 maxReminders 配额、无时间冷却、不参与有效性结算(定期保养,非故障)。
+  // roundReplan: 连续 N 个工作回合未重规划 → 新回合开始时注入;
+  // roundReplanMinCalls: 步数下限,纯寒暄轮不推进里程碑;
+  // stepReplan: 每 N 次工具调用无条件触发(单 prompt 马拉松也会被抬头)。
+  roundReplan: true,
+  roundReplanRounds: 8,
+  roundReplanMinCalls: 10,
+  stepReplan: true,
+  stepReplanCalls: 80,
+  // 用户可见性(v0.9):静默 ≠ 无感。提醒类注入末尾附呈报指令,要求 AI 在下一次
+  // 可见回复开头用一行向用户简报「AI 抬头提醒了我:<原因>,我接下来:<动作>」。
+  // 时钟锚点与坑位登记不附呈报,避免刷屏。
+  showToUser: true,
   // lesson ledger (v0.5): failures register pitfalls, new agents get the top ones
   lessons: true,
   // lesson TTL (v0.8.4): pitfalls not re-hit within N days are dropped; 0 = keep forever.
@@ -315,6 +334,7 @@ function freshState() {
     fileHashes: {}, pendingReminders: [],
     driftChecks: 0, lastDriftAt: 0, callsAtLastDrift: 0,
     clockInterval: 0,
+    replanRounds: 0, callsAtReplan: 0, replans: 0,
   };
 }
 
@@ -473,12 +493,46 @@ function nudgeText(state, cfg, now, specific) {
   if (state.reminders >= 3) {
     lines.push('⚠️ 第 ' + (state.reminders + 1) + ' 次提醒仍无改善——停止当前方法,直接向用户汇报卡点。');
   }
+  const rl = reportLine(cfg);
+  if (rl) lines.push(rl);
   return lines.join('\n');
 }
 
 const clockText = (state, now) => '🕐 【AI 抬头 · 本地时钟】' + localHm(now)
   + ',已进行 ' + minutesSince(state, now).toFixed(0) + ' 分钟(开始于 ' + localHm(state.startedAt)
   + ')。耗时预估/汇报以此为准,勿自估。';
+
+/** Shared reset point for both milestone triggers: either one firing zeroes both counters. */
+function replanReset(st) {
+  st.replanRounds = 0;
+  st.callsAtReplan = st.toolCalls;
+  st.replans += 1;
+}
+
+/** Milestone reminder text; rounds/steps are the true accumulation since the last re-plan. */
+function replanText(rounds, steps, cfg) {
+  const lines = [
+    '🧭 【AI 抬头 · 轮次里程碑】已连续 ' + rounds + ' 个回合 / ' + steps
+      + ' 次调用没做全局重规划。停一下,先重新规划全局:',
+    '① 跳出当前子问题,回到最初目标:整体进展到哪一步?剩余路径有哪些?',
+    '② 检视当前方法是否在钻牛角尖(局部最优):列出 2~3 条备选路线并比较;',
+    '③ 若当前路线仍是最优,一句话说明依据后继续;否则换路线,或向用户汇报卡点。',
+  ];
+  if (rounds >= 2 * cfg.roundReplanRounds || steps >= 2 * cfg.stepReplanCalls) {
+    lines.push('⚠️ 本里程碑拖到阈值的两倍才触发——上次的重规划提醒八成被无视了。'
+      + '本轮必须先规划再动手;若上轮规划后仍走的原路线,这次请直接向用户汇报卡点。');
+  }
+  const rl = reportLine(cfg);
+  if (rl) lines.push(rl);
+  return lines.join('\n');
+}
+
+/** 用户可见性呈报指令(与 Python 侧 report_line 同一文案)。 */
+function reportLine(cfg) {
+  if (!cfg.showToUser) return '';
+  return '📣 【呈报】请在你的下一次可见回复开头,用一行向用户简报本提醒:'
+    + '「AI 抬头提醒了我:<触发原因>,我接下来:<一句话动作>」。仅此一行,不要展开。';
+}
 
 function buildReviewMaterial(state, cfg, now, kind, detail) {
   const log = state.recentLog;
@@ -843,6 +897,18 @@ export function apply(ctx, config) {
             st.goal = event.data.text.slice(0, 400);
           }
         } catch { /* goal capture is best-effort */ }
+        // 回合里程碑:连续 N 个回合未做全局重规划 → 新回合开始时强制抬头。
+        // 步数下限挡住纯寒暄轮;计数跨回合累计,只有真正触发才复位(replanReset)。
+        if (cfg.enabled && cfg.roundReplan) {
+          st.replanRounds += 1;
+          const steps = st.toolCalls - st.callsAtReplan;
+          if (st.replanRounds >= cfg.roundReplanRounds
+              && steps >= cfg.roundReplanMinCalls) {
+            const rounds = st.replanRounds;
+            replanReset(st);
+            deliver(agent, ctx, replanText(rounds, steps, cfg));
+          }
+        }
         // 会话中途注册的坑位也要有投递点:每 5 个回合强制重注一次
         if (cfg.lessons) {
           const known = lessonsMessage(st, st.promptResets % 5 === 0, cfg);
@@ -864,7 +930,8 @@ export function apply(ctx, config) {
           '1. 明确向用户汇报:你做了什么尝试、卡在哪里、下一步建议是什么;',
           '2. 如果还有未完成的检查,先完成再结束;',
           '3. 不要默默结束一段没有产出的长时间运行。',
-        ].join('\n');
+          reportLine(cfg),
+        ].filter(Boolean).join('\n');
         deliverOrReview(agent, st, 'stop-check', '会话结束时累计 ' + st.toolCalls + ' 次调用零修改', text);
       }
     } catch (error) {
@@ -951,6 +1018,8 @@ export function apply(ctx, config) {
             if (st.reminders >= 3) {
               text += '\n⚠️ 这已是本会话第 ' + (st.reminders + 1) + ' 次提醒。请考虑完全放弃当前路径,直接向用户汇报。';
             }
+            const rl = reportLine(cfg);
+            if (rl) text += '\n' + rl;
             const streak = st.failStreak;
             deliverOrReview(agent, st, 'fail-loop',
               '连续失败 ' + streak + ' 次', text);
@@ -1024,14 +1093,26 @@ export function apply(ctx, config) {
         reviewer.review(agent, material, driftSignal, REVIEW_DRIFT_SYSTEM).then((raw) => {
           const verdict = parseVerdict(raw);
           if (verdict && verdict.verdict !== 'on-track') {
-            deliver(agent, ctx, '🎯 【AI 抬头 · 目标漂移巡检】判定: ' + (DRIFT_LABEL[verdict.verdict] ?? verdict.verdict)
+            let driftText = '🎯 【AI 抬头 · 目标漂移巡检】判定: ' + (DRIFT_LABEL[verdict.verdict] ?? verdict.verdict)
               + '\n漂移表现: ' + (verdict.reason || '(未给出)')
               + '\n收束建议: ' + (verdict.suggestion || '(未给出)')
-              + '\n请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。');
+              + '\n请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。';
+            const rl = reportLine(cfg);
+            if (rl) driftText += '\n' + rl;
+            deliver(agent, ctx, driftText);
           }
         }).catch((error) => {
           ctx?.logger?.warn?.('[ai-look-up] drift patrol failed: %o', error);
         });
+      }
+      // step milestone (v0.9): unconditionally force a global re-plan every N calls.
+      // fire() 不复位 callsAtReplan,负向提醒在中间连发也不会推迟或吞掉本里程碑。
+      if (cfg.enabled && cfg.stepReplan
+          && st.toolCalls - st.callsAtReplan >= cfg.stepReplanCalls) {
+        const rounds = st.replanRounds;
+        const steps = st.toolCalls - st.callsAtReplan;
+        replanReset(st);
+        deliver(agent, ctx, replanText(rounds, steps, cfg));
       }
       // local clock anchor, lowest priority; quiet within 2 minutes of a nudge
       if (cfg.clockTick && now - st.lastReminderAt >= 120000) {

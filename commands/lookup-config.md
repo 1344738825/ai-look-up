@@ -39,6 +39,12 @@ argument-hint: "[要调整的参数=新值, 或留空查看]"
 | `drift_check` | `true` | 目标漂移巡检(需审查者可用) |
 | `drift_check_calls` | `30` | 每 N 次调用巡检一次 |
 | `drift_cooldown_sec` | `900` | 巡检冷却(秒) |
+| `round_replan` | `true` | 轮次里程碑:连续 N 回合未重规划 → 回合开始强制重规划提醒 |
+| `round_replan_rounds` | `8` | 连续 N 个工作回合未全局重规划 → 触发回合里程碑 |
+| `round_replan_min_calls` | `10` | 回合里程碑的步数下限:自上次重规划以来至少 N 次调用(纯寒暄轮不计) |
+| `step_replan` | `true` | 步数里程碑:每 N 步调用无条件强制一次全局重规划 |
+| `step_replan_calls` | `80` | 每 N 次工具调用触发一次步数里程碑 |
+| `show_to_user` | `true` | 用户可见呈报:提醒要求 AI 在可见回复开头一行简报,信封附 systemMessage |
 | `lessons` | `true` | 教训登记簿:失败登记坑位,回合开始注入 Top 3 |
 | `lessons_ttl_days` | `7` | 坑位超过 N 天未被再次踩到即自动淘汰;`0` = 永不淘汰 |
 | `llm_review` | `false` | 触发提醒时用独立 LLM 上下文审查是否空跑 |

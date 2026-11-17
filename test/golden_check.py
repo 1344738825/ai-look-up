@@ -553,6 +553,65 @@ def _p_drift_count(dc, cd):
         lk.call_llm_review = saved
 
 
+def _p_round_replan_rounds(n):
+    """阈值 n:第 n-1 个回合静默、第 n 个回合触发(步数下限 0 放行)——双向锚定。"""
+    cfg = _cfg(round_replan_rounds=n, round_replan_min_calls=0, lessons=False,
+               step_replan_calls=10 ** 9)
+    st = lk.new_state("brr-%d" % n, 1000.0)
+    now = 1000.0
+    fired_at = None
+    for i in range(n + 1):
+        now += 60
+        # 每回合垫一次真实调用,让回合流与真实使用一致(不影响判定)
+        lk.handle_post_use(cfg, {"tool_name": "Read", "tool_input": {"file_path": "f%d" % i}},
+                           st, now)
+        now += 1
+        o = lk.handle_prompt(cfg, {"prompt": "任务 %d" % i}, st, now)
+        if o and "轮次里程碑" in str(o) and fired_at is None:
+            fired_at = i + 1
+    return fired_at
+
+
+def _p_round_replan_min_calls(mc):
+    """步数下限:回合数够但步数不足 → 静默;步数补足后 → 触发。"""
+    cfg = _cfg(round_replan_rounds=2, round_replan_min_calls=mc, lessons=False,
+               step_replan_calls=10 ** 9)
+    st = lk.new_state("brm-%d" % mc, 1000.0)
+    now = 1000.0
+    early_fired = False
+    for i in range(2):
+        now += 1
+        o = lk.handle_prompt(cfg, {"prompt": "t%d" % i}, st, now)
+        if o and "轮次里程碑" in str(o):
+            early_fired = True
+    for i in range(mc):
+        now += 1
+        lk.handle_post_use(cfg, {"tool_name": "Read", "tool_input": {"file_path": "f%d" % i}},
+                           st, now)
+    now += 1
+    o = lk.handle_prompt(cfg, {"prompt": "t2"}, st, now)
+    late_fired = bool(o and "轮次里程碑" in str(o))
+    return (early_fired, late_fired)
+
+
+def _p_step_replan_calls(sc):
+    """阈值 sc:第 sc 次调用必触发、第 sc-1 次静默——双向锚定。
+    回合阈值与 no-output 阈值拉大以隔离,时钟/巡检由 _cfg 关闭。"""
+    cfg = _cfg(step_replan_calls=sc, round_replan_rounds=10 ** 9, lessons=False,
+               call_nudge_interval=10 ** 9, long_run_minutes=10 ** 9,
+               long_run_min_calls=10 ** 9)
+    st = lk.new_state("bsr-%d" % sc, 1000.0)
+    now = 1000.0
+    fired_at = None
+    for i in range(sc + 1):
+        now += 1
+        o = lk.handle_post_use(cfg, {"tool_name": "Read", "tool_input": {"file_path": "f%d" % i}},
+                               st, now)
+        if o and "轮次里程碑" in str(o) and fired_at is None:
+            fired_at = i + 1
+    return fired_at
+
+
 def _p_escalate(esc):
     cfg = _cfg(escalate_after_reminders=esc, deliver_review=True, llm_api_key="d",
                fail_streak_threshold=1)
@@ -682,6 +741,12 @@ BEHAVIOR_KEYS = {
                           _eq(7), "间隔 5，40 次调用 → 巡检 7 次"),
     "drift_cooldown_sec": (lambda: _p_drift_count(5, 0),
                            _nonzero, "冷却 0 → 巡检多次发生"),
+    "round_replan_rounds": (lambda: _p_round_replan_rounds(3),
+                            _eq(3), "阈值 3：前 2 回合静默、第 3 回合触发"),
+    "round_replan_min_calls": (lambda: _p_round_replan_min_calls(5),
+                               _eq((False, True)), "下限 5：步数不足静默、补足后触发"),
+    "step_replan_calls": (lambda: _p_step_replan_calls(5),
+                          _eq(5), "阈值 5：第 4 次静默、第 5 次触发"),
     "escalate_after_reminders": (lambda: _p_escalate(3),
                                  _eq(1), "门槛 3(reminders 到 3) → 投递 1 件请求"),
     "request_poll_sec": (lambda: _p_request_poll_sec(7),
@@ -727,6 +792,61 @@ check("behavior script_extensions（norm_cmd 行为随 spec 扩展名集合变�
       lk.norm_cmd("python a1.ps1") == "python a.ps1"
       and lk.norm_cmd("python a1.mjs") == "python a.mjs"
       and lk.norm_cmd("python a1.noext") == "python a1.noext")
+
+
+# 10) 用户可见呈报（v0.9）：show_to_user 开启 → 提醒文案附📣呈报指令、信封附
+#     systemMessage；关闭 → 两者都不出现,但提醒本身照常注入。驱动真实入口,
+#     观察可观测输出,不手工复刻被测逻辑。
+def probe_show_to_user(show):
+    cfg = _cfg(show_to_user=show, lessons=False, round_replan_rounds=2,
+               round_replan_min_calls=0, step_replan_calls=10 ** 9)
+    st = lk.new_state("bstu-%s" % show, 1000.0)
+    now = 1000.0
+    now += 1
+    o1 = lk.handle_prompt(cfg, {"prompt": "任务 A"}, st, now)
+    now += 60
+    lk.handle_post_use(cfg, {"tool_name": "Read", "tool_input": {"file_path": "f"}}, st, now)
+    now += 1
+    o2 = lk.handle_prompt(cfg, {"prompt": "任务 B"}, st, now)
+    blob = _json.dumps([o1, o2], ensure_ascii=False)
+    return ("呈报" in blob, "systemMessage" in blob)
+
+
+check("behavior show_to_user 开启 → 文案含呈报指令 + 信封含 systemMessage",
+      probe_show_to_user(True) == (True, True))
+check("behavior show_to_user 关闭 → 回到完全静默形态",
+      probe_show_to_user(False) == (False, False))
+
+
+def probe_show_sys_fail(show):
+    cfg = _cfg(show_to_user=show, fail_streak_threshold=1)
+    st = lk.new_state("bsf-%s" % show, 1000.0)
+    o = lk.handle_post_fail(cfg, {"tool_name": "Bash", "tool_input": {"command": "boom"}}, st, 1100.0)
+    return _json.dumps(o, ensure_ascii=False)
+
+
+check("behavior show_to_user 失败信封附 systemMessage（呈报头行）",
+      '"systemMessage"' in probe_show_sys_fail(True))
+check("behavior show_to_user 关闭 → 失败信封无 systemMessage",
+      '"systemMessage"' not in probe_show_sys_fail(False))
+
+
+# 11) enabled=false 必须连同里程碑一起静默(里程碑不走 fire(),fire() 的
+#     enabled 检查罩不到;JS 端由 dsh-smoke #6 覆盖,此处补 Python 侧)。
+def probe_enabled_off_milestone():
+    cfg = _cfg(enabled=False, lessons=False, round_replan_rounds=1,
+               round_replan_min_calls=0, step_replan_calls=1)
+    st = lk.new_state("ben-off", 1000.0)
+    now = 1000.0
+    out1 = lk.handle_prompt(cfg, {"prompt": "任务"}, st, now)
+    now += 1
+    out2 = lk.handle_post_use(cfg, {"tool_name": "Read", "tool_input": {"file_path": "f"}}, st, now)
+    blob = _json.dumps([out1, out2], ensure_ascii=False)
+    return "轮次里程碑" in blob
+
+
+check("behavior enabled=false → 回合/步数里程碑一并静默",
+      probe_enabled_off_milestone() is False)
 
 
 print()

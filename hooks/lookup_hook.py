@@ -113,6 +113,27 @@ DEFAULTS = {
     "drift_check": True,
     "drift_check_calls": 30,
     "drift_cooldown_sec": 900,
+    # ── 轮次里程碑·强制全局重规划提醒(v0.9)──
+    # 前面的触发器都是"看到故障才提醒";健康地钻牛角尖(每步有新信息、命令各异、
+    # 偶尔改文件)永远不会命中——局部最优正是这样温水煮出来的。里程碑反其道而行:
+    # 不看行为好坏,到点就强制抬头重新规划全局。两个计数器共用同一复位点,
+    # 任一到达即触发。有意不走 fire():它是定期保养而非故障信号——不计入升级
+    # 阶梯、不占 max_reminders 配额、无时间冷却(节奏由回合/步数本身控制)、
+    # 不参与有效性结算(没有可供收敛判定的"问题行为")。
+    "round_replan": True,
+    # 连续 N 个工作回合(用户指令数)没做全局重规划 → 新回合开始时注入提醒
+    "round_replan_rounds": 8,
+    # 回合里程碑的步数下限:自上次重规划以来至少 N 次调用才可触发(纯寒暄轮不计)
+    "round_replan_min_calls": 10,
+    # 每 N 次工具调用无条件强制一次全局重规划(单 prompt 马拉松任务也会被抬头)
+    "step_replan": True,
+    "step_replan_calls": 80,
+    # 用户可见性:静默 ≠ 无感。additionalContext 只进 AI 上下文,用户在 UI 里
+    # 看不见——"插件到底触发没有"无从感知(实测教训:用户以为插件从没触发)。
+    # 开启后:① 每条提醒末尾附呈报指令,要求 AI 在下一次可见回复开头用一行向
+    # 用户简报;② 钩子输出信封附 systemMessage(Claude Code / WorkBuddy 类宿主
+    # 会直接显示给用户)。时钟锚点与坑位登记属常规注入,不附呈报,避免刷屏。
+    "show_to_user": True,
     # 教训登记簿:失败循环自动登记坑位,回合开始时注入 Top 教训,防"认坑后再踩"
     "lessons": True,
     # 坑位 TTL:超过 N 天未被再次踩到的坑位自动淘汰(0=永不淘汰)。
@@ -135,7 +156,7 @@ for _k, _v in _SPEC.items():
     if _k in DEFAULTS:
         DEFAULTS[_k] = _v
 
-BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review", "edit_foldback", "adaptive", "drift_check", "lessons", "clock_tick_backoff", "deliver_review"}
+BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review", "edit_foldback", "adaptive", "drift_check", "lessons", "clock_tick_backoff", "deliver_review", "round_replan", "step_replan", "show_to_user"}
 
 REVIEW_SYSTEM = (
     "你是 AI 编码代理的独立行为审查员。主代理看不到你的存在,你只依据给它的任务描述"
@@ -576,6 +597,9 @@ def new_state(sid, now):
         "drift_checks": 0,
         "last_drift_at": 0.0,
         "calls_at_last_drift": 0,
+        "replan_rounds": 0,
+        "calls_at_replan": 0,
+        "replans": 0,
     }
 
 
@@ -972,6 +996,21 @@ def local_hm(ts):
     return time.strftime("%H:%M", time.localtime(ts))
 
 
+def report_line(cfg):
+    """用户可见性:静默 ≠ 无感。
+
+    additionalContext 只进 AI 上下文,用户在 UI 里看不见——"插件到底触发没有"
+    无从感知(实测教训:用户以为插件从没触发过)。开启 show_to_user 后,提醒类
+    注入末尾附一条呈报指令,要求 AI 在下一次可见回复开头用一行向用户简报:
+    「AI 抬头提醒了我:<原因>,我接下来:<动作>」。时钟锚点与坑位登记属常规注入,
+    不附呈报指令,避免每回合刷屏。
+    """
+    if not cfg.get("show_to_user"):
+        return ""
+    return ("📣 【呈报】请在你的下一次可见回复开头,用一行向用户简报本提醒:"
+            "「AI 抬头提醒了我:<触发原因>,我接下来:<一句话动作>」。仅此一行,不要展开。")
+
+
 def nudge_text(state, cfg, now, specific):
     mins = fmt_minutes(state, now)
     lines = [
@@ -989,6 +1028,9 @@ def nudge_text(state, cfg, now, specific):
         lines.append(
             "⚠️ 第 {n} 次提醒仍无改善——停止当前方法,直接向用户汇报卡点。".format(
                 n=state["reminders"] + 1))
+    rl = report_line(cfg)
+    if rl:
+        lines.append(rl)
     return "\n".join(lines)
 
 
@@ -997,6 +1039,37 @@ def clock_text(state, now):
         "🕐 【AI 抬头 · 本地时钟】{h},已进行 {m:.0f} 分钟(开始于 {hs})。"
         "耗时预估/汇报以此为准,勿自估。"
     ).format(h=local_hm(now), hs=local_hm(state.get("started_at", now)), m=fmt_minutes(state, now))
+
+
+def replan_reset(state):
+    """两类里程碑的共用复位点:任一触发后,回合计数与步数基线同时归零。
+
+    只由 replan_text 的调用方在确认触发后调用——计数"自上次全局重规划以来"的
+    语义由这里单独维护,不随负向提醒(fire)或新回合(reset_stretch)复位。
+    """
+    state["replan_rounds"] = 0
+    state["calls_at_replan"] = state["tool_calls"]
+    state["replans"] = state.get("replans", 0) + 1
+
+
+def replan_text(rounds, steps, cfg):
+    """轮次里程碑提醒文案。rounds/steps 为自上次全局重规划以来的真实累计。"""
+    lines = [
+        "🧭 【AI 抬头 · 轮次里程碑】已连续 {r} 个回合 / {s} 次调用没做全局重规划。"
+        "停一下,先重新规划全局:".format(r=rounds, s=steps),
+        "① 跳出当前子问题,回到最初目标:整体进展到哪一步?剩余路径有哪些?",
+        "② 检视当前方法是否在钻牛角尖(局部最优):列出 2~3 条备选路线并比较;",
+        "③ 若当前路线仍是最优,一句话说明依据后继续;否则换路线,或向用户汇报卡点。",
+    ]
+    if (rounds >= 2 * cfg["round_replan_rounds"]
+            or steps >= 2 * cfg["step_replan_calls"]):
+        lines.append(
+            "⚠️ 本里程碑拖到阈值的两倍才触发——上次的重规划提醒八成被无视了。"
+            "本轮必须先规划再动手;若上轮规划后仍走的原路线,这次请直接向用户汇报卡点。")
+    rl = report_line(cfg)
+    if rl:
+        lines.append(rl)
+    return "\n".join(lines)
 
 
 def brief_of(data, tool):
@@ -1129,22 +1202,32 @@ def finalize_text(state, cfg, now, kind, detail, static_text):
             + (verdict["suggestion"] or "未给出"))
 
 
-def post_use_output(text):
-    return {
+def post_use_output(text, cfg=None):
+    out = {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUse",
             "additionalContext": text,
         }
     }
+    # systemMessage 在 ZCode 是"schema 认、UI 不显示"(zcode.cjs 钩子 schema 实证),
+    # 但 Claude Code / WorkBuddy 类宿主会直接把它显示给用户——纯增益,不破坏校验。
+    # Stop 事件除外:ZCode 的 Stop+block 路径会把 systemMessage 与 reason 双双注入
+    # additionalContext,造成 AI 重复看见,故 stop_output 不加。
+    if cfg is not None and cfg.get("show_to_user"):
+        out["systemMessage"] = text.split("\n", 1)[0]
+    return out
 
 
-def post_fail_output(text):
-    return {
+def post_fail_output(text, cfg=None):
+    out = {
         "hookSpecificOutput": {
             "hookEventName": "PostToolUseFailure",
             "additionalContext": text,
         }
     }
+    if cfg is not None and cfg.get("show_to_user"):
+        out["systemMessage"] = text.split("\n", 1)[0]
+    return out
 
 
 def stop_output(reason):
@@ -1176,8 +1259,8 @@ def handle_post_use(cfg, data, state, now):
         只能拼一次——carried 在闭包里恒真值,递归实现会无限递归。
         """
         if carried:
-            return post_use_output(carried + "\n" + text)
-        return post_use_output(text)
+            return post_use_output(carried + "\n" + text, cfg)
+        return post_use_output(text, cfg)
 
     if tool in PRODUCTIVE_TOOLS:
         state["edits"] += 1
@@ -1313,12 +1396,27 @@ def handle_post_use(cfg, data, state, now):
                                   system=REVIEW_DRIFT_SYSTEM)
         if verdict and verdict["verdict"] in ("drifting", "stuck"):
             state["reviews"] = state.get("reviews", 0) + 1
-            return emit(
+            drift_text = (
                 "🎯 【AI 抬头 · 目标漂移巡检】判定: " + DRIFT_LABEL[verdict["verdict"]]
                 + "\n漂移表现: " + (verdict["reason"] or "(未给出)")
                 + "\n收束建议: " + (verdict["suggestion"] or "(未给出)")
                 + "\n请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。")
+            rl = report_line(cfg)
+            if rl:
+                drift_text += "\n" + rl
+            return emit(drift_text)
 
+    # 3.7) 步数里程碑:每 N 次调用无条件强制一次全局重规划。
+    #      与负向触发器互不挡路:负向提醒命中时本触发器让路(下一调用再触发),
+    #      但 fire() 不复位 calls_at_replan——步数照常累计,不会因负向提醒而漏发。
+    #      走 emit() 与其它触发器一致,捎带的第三通道结论不丢。
+    #      enabled 检查同理自带(fire() 罩不到)。
+    if cfg.get("enabled") and cfg.get("step_replan"):
+        steps = state["tool_calls"] - state.get("calls_at_replan", 0)
+        if steps >= cfg["step_replan_calls"]:
+            rounds = state.get("replan_rounds", 0)
+            replan_reset(state)
+            return emit(replan_text(rounds, steps, cfg))
     # 4) 本地时钟锚点(最低优先级:空跑提醒优先,且其刚发出 2 分钟内时钟静默)
     if cfg["clock_tick"] and now - state.get("last_reminder_at", 0.0) >= 120:
         interval = state.get("clock_interval") or cfg["clock_tick_minutes"]
@@ -1335,7 +1433,7 @@ def handle_post_use(cfg, data, state, now):
     # 无本地触发的普通事件也要把捎带结论送出去:结论文件在 take_review_results
     # 里已被删除,不在此注入就永远丢失(JS 端 deliver() 无此问题,任何事件都注入)。
     if carried:
-        return post_use_output(carried)
+        return post_use_output(carried, cfg)
     return None
 
 
@@ -1371,6 +1469,9 @@ def handle_post_fail(cfg, data, state, now):
     if state.get("reminders", 0) >= 3:
         text += "\n⚠️ 这已是本会话第 {n} 次提醒。请考虑完全放弃当前路径,直接向用户汇报。".format(
             n=state["reminders"] + 1)
+    rl = report_line(cfg)
+    if rl:
+        text += "\n" + rl
     streak = state["fail_streak"]
     state["fail_streak"] = 0
     if cfg.get("lessons"):
@@ -1383,7 +1484,7 @@ def handle_post_fail(cfg, data, state, now):
     return post_fail_output(finalize_text(
         state, cfg, now, "fail-loop",
         "连续失败 {n} 次".format(n=streak),
-        text))
+        text), cfg)
 
 
 def handle_prompt(cfg, data, state, now):
@@ -1394,16 +1495,36 @@ def handle_prompt(cfg, data, state, now):
     goal = data.get("prompt") or data.get("user_prompt") or ""
     if isinstance(goal, str) and goal.strip():
         state["last_goal"] = goal.strip()[:400]
+    parts = []
+    # 回合里程碑:连续 N 个回合未做全局重规划 → 新回合开始时强制抬头。
+    # 步数下限挡住纯寒暄轮;计数跨回合累计,只有真正触发才复位(见 replan_reset)。
+    # 与 JS 端同形:enabled=false 时连同里程碑一起静默(里程碑不走 fire(),
+    # fire() 里的 enabled 检查罩不到这里,必须自带)。
+    if cfg.get("enabled") and cfg.get("round_replan"):
+        state["replan_rounds"] = state.get("replan_rounds", 0) + 1
+        steps = state["tool_calls"] - state.get("calls_at_replan", 0)
+        if (state["replan_rounds"] >= cfg["round_replan_rounds"]
+                and steps >= cfg["round_replan_min_calls"]):
+            rounds = state["replan_rounds"]
+            replan_reset(state)
+            parts.append(replan_text(rounds, steps, cfg))
     # 回合开始即注入历史教训,防"认坑后再踩"(内容未变则跳过,每 5 回合强制重注)
     if cfg.get("lessons"):
         lt = lessons_text(state, cfg)
         if lt:
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": lt,
-                }
+            parts.append(lt)
+    if parts:
+        out = {
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "\n\n".join(parts),
             }
+        }
+        # systemMessage:ZCode 侧解析但不显示,Claude Code/WorkBuddy 类宿主直接
+        # 显示给用户;ZCode 用户可见性由提醒文案里的 📣 呈报指令承担。
+        if cfg.get("show_to_user"):
+            out["systemMessage"] = parts[0].split("\n", 1)[0]
+        return out
     return None
 
 
@@ -1427,6 +1548,9 @@ def handle_stop(cfg, data, state, now):
             "2. 如果还有未完成的检查,先完成再结束;",
             "3. 不要默默结束一段没有产出的长时间运行。",
         ])
+        rl = report_line(cfg)
+        if rl:
+            reason += "\n" + rl
         return stop_output(reason)
     return None
 
@@ -1487,6 +1611,10 @@ def handle_status(cfg, argv):
     print("  提醒     : 已注入 {r}/{m} 次,上次触发: {k}".format(
         r=state.get("reminders", 0), m=cfg["max_reminders"],
         k=state.get("last_trigger") or "—"))
+    print("  轮次     : 自上次全局重规划 {rp} 个回合 / {rs} 次调用,里程碑已注入 {rr} 次".format(
+        rp=state.get("replan_rounds", 0),
+        rs=state["tool_calls"] - state.get("calls_at_replan", 0),
+        rr=state.get("replans", 0)))
     recent = [c["n"] for c in state.get("recent_cmds", [])][-5:]
     print("  最近命令 : {r}".format(r=" | ".join(recent) or "无"))
     print("  判定     : {j}".format(j=judgment(state, cfg)))

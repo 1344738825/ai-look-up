@@ -4,14 +4,14 @@
     {
       "name": "ai-look-up",
       "source": ".",
-      "version": "0.8.4",
-      "description": "Catches aimless AI grinding (repeated commands, failure loops, long runs with no output) and nudges the agent to stop and self-review mid-run. Also injects the real local time on a schedule, since agents are bad at judging how long they've been going. v0.7 adds an out-of-host review channel: the hook writes a request, and an independent watcher process (with its own API key) reviews asynchronously and sends back a verdict. The main agent never touches this path.",
+      "version": "0.9.0",
+      "description": "Catches aimless AI grinding (repeated commands, failure loops, long runs with no output) and nudges the agent to stop and self-review mid-run. Also injects the real local time on a schedule, since agents are bad at judging how long they've been going. v0.7 adds an out-of-host review channel: the hook writes a request, and an independent watcher process (with its own API key) reviews asynchronously and sends back a verdict. The main agent never touches this path. v0.9 adds round milestones: every N turns or every N tool calls, it force-injects a global re-plan prompt regardless of behavior, against local-optimum grinding.",
       "displayName": "AI Look-Up",
       "displayName_i18n": {
         "zh-CN": "AI 抬头"
       },
       "description_i18n": {
-        "zh-CN": "盯住 AI 的空跑:重复的命令、连续失败、跑很久却没产出文件。命中就在运行中途提醒它停一下自查,并定期把真实本地时间注进去——AI 估不准自己花了多久。v0.7 加了第三通道:钩子只写一张请求单,宿主外面一个独立 watcher(用自己的 key)异步审查再回注结论,主代理全程碰不到这条链路。带 /lookup-review、/lookup-status、/lookup-config、/lookup-watch 四个命令。"
+        "zh-CN": "盯住 AI 的空跑:重复的命令、连续失败、跑很久却没产出文件。命中就在运行中途提醒它停一下自查,并定期把真实本地时间注进去——AI 估不准自己花了多久。v0.7 加了第三通道:钩子只写一张请求单,宿主外面一个独立 watcher(用自己的 key)异步审查再回注结论,主代理全程碰不到这条链路。带 /lookup-review、/lookup-status、/lookup-config、/lookup-watch 四个命令。v0.9 加了轮次里程碑:连续 N 个回合或每 N 步调用,不看行为好坏强制注入一次全局重规划提醒,专治钻牛角尖陷入局部最优。"
       },
       "category": "productivity"
     }
