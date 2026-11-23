@@ -667,6 +667,26 @@ def _p_lessons_ttl_days(ttl):
     return (with_ttl is None, no_ttl is not None and "ttl_probe" in no_ttl)
 
 
+def _p_lesson_guard_hits(gh):
+    """阈值 gh:hits=gh 时 PreToolUse 硬拦截(block);hits=gh-1 且参数不同时仅软预警。"""
+    import time as _t
+    now = _t.time()
+    with open(lk.lessons_path(), "w", encoding="utf-8") as f:
+        json.dump([{"pattern": "python guard_probe.py", "correction": "c",
+                    "hits": gh, "last_seen": now}], f)
+    cfg = _cfg(lessons=True, lesson_guard=True, lesson_guard_hits=gh)
+    st = lk.new_state("bgh-%d" % gh, now)
+    out_hit = lk.handle_pre_use(cfg, {"tool_name": "Bash",
+                                      "tool_input": {"command": "python guard_probe.py --new"}}, st, now)
+    with open(lk.lessons_path(), "w", encoding="utf-8") as f:
+        json.dump([{"pattern": "python guard_probe.py", "correction": "c",
+                    "hits": gh - 1, "last_seen": now}], f)
+    out_warn = lk.handle_pre_use(cfg, {"tool_name": "Bash",
+                                       "tool_input": {"command": "python guard_probe.py --new"}}, st, now)
+    return (bool(out_hit and out_hit.get("decision") == "block"),
+            bool(out_warn and out_warn.get("decision") != "block" and "坑位预警" in str(out_warn)))
+
+
 # 每键一条行为断言，形式为 (探针, 锚定期望, 说明)：
 #   探针()      -> 观测值
 #   期望(观测值) -> 该观测值是否符合"键按文档语义生效"的**正向**预期
@@ -753,6 +773,8 @@ BEHAVIOR_KEYS = {
                          _eq(7), "spec 轮询 7s → run_loop 睡 7s"),
     "lessons_ttl_days": (lambda: _p_lessons_ttl_days(7),
                          _eq((True, True)), "TTL 7 天:8 天前的坑位不再注入;TTL=0 永不过期仍注入"),
+    "lesson_guard_hits": (lambda: _p_lesson_guard_hits(2),
+                          _eq((True, True)), "阈值 2:hits=2 硬拦截(block),hits=1 仅软预警"),
 }
 
 # 这些键的行为断言由 test/channel_check.py 覆盖（第三通道端到端），

@@ -635,4 +635,27 @@ const texts = (agent) =>
   console.log('PASS  lesson TTL drops pitfalls not re-hit within the window');
 }
 
+// 29) Pre-execution lesson guard: exact failing command is blocked on tools/guard
+{
+  const { emit, makeAgent } = makeHarness({});
+  const agent = makeAgent();
+  emit('agent/created', agent);
+  for (let i = 0; i < 3; i++) {
+    emit('tools/result', exec(agent, 'Bash', { command: 'python crash_me.py --bad' }), { isError: true });
+  }
+  let guardRes = null;
+  const handlers = {};
+  const ctx = {
+    on(name, fn) { (handlers[name] ??= []).push(fn); },
+    logger: { warn: () => {} },
+    tools: { guard(fn) { guardRes = fn; } },
+  };
+  apply(ctx, {});
+  assert.equal(typeof guardRes, 'function', 'apply must register ctx.tools.guard when available');
+  const blocked = guardRes(exec(agent, 'Bash', { command: 'python crash_me.py --bad' }));
+  assert.equal(blocked?.decision, 'block', 'exact repeat of a fail-loop command must be blocked');
+  assert(blocked?.reason?.includes('坑位拦截'), 'block reason must identify the lesson guard');
+  console.log('PASS  ctx.tools.guard blocks exact repeat of a fail-loop command');
+}
+
 console.log('ALL DSH SMOKE TESTS PASSED');

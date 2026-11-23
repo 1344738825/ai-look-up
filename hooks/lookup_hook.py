@@ -38,6 +38,28 @@ import urllib.request
 import uuid
 
 PRODUCTIVE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "ApplyPatch"}
+_PRODUCTIVE_ALIASES = {
+    "edit", "write", "multiedit", "notebookedit", "applypatch",
+    "write_file", "edit_file", "create_file", "replace_file_content",
+    "multi_replace_file_content", "str_replace_editor",
+    "str_replace_based_edit_tool", "patch", "file_edit", "file_write",
+}
+_SHELL_ALIASES = {
+    "bash", "run_command", "run_shell_command", "execute_command",
+    "shell", "terminal", "cmd",
+}
+_PATH_KEYS = ("file_path", "path", "notebook_path", "TargetFile", "target_file", "Path", "filePath")
+_CMD_KEYS = ("command", "cmd", "script", "CommandLine", "command_line")
+
+
+def is_productive_tool(tool):
+    t = str(tool or "")
+    return t in PRODUCTIVE_TOOLS or t.lower() in _PRODUCTIVE_ALIASES
+
+
+def is_shell_tool(tool):
+    t = str(tool or "")
+    return t == "Bash" or t.lower() in _SHELL_ALIASES
 
 # 会话闲置超过该秒数后,下一次事件视为新的工作时段
 STALE_AFTER_SEC = 2 * 3600
@@ -139,6 +161,9 @@ DEFAULTS = {
     # 坑位 TTL:超过 N 天未被再次踩到的坑位自动淘汰(0=永不淘汰)。
     # 没有它,开发期的测试数据会按 hits 排序永久占据注入名额。
     "lessons_ttl_days": 7,
+    # PreToolUse 坑位拦截:命令执行前对照账本,原样重犯或被踩 >= lesson_guard_hits 次硬拦截,首次仅软预警。
+    "lesson_guard": True,
+    "lesson_guard_hits": 2,
     # ── 第三通道:投递请求 + 独立 watcher（v0.7）──
     # 钩子只写请求单就返回（不阻塞），常驻 watcher 用自己的 key 去审，结论回投后
     # 由下一次钩子事件捎带注入。主 agent 全程不在链路上 → 独立性最强。
@@ -156,7 +181,7 @@ for _k, _v in _SPEC.items():
     if _k in DEFAULTS:
         DEFAULTS[_k] = _v
 
-BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review", "edit_foldback", "adaptive", "drift_check", "lessons", "clock_tick_backoff", "deliver_review", "round_replan", "step_replan", "show_to_user"}
+BOOL_KEYS = {"enabled", "stop_check", "clock_tick", "llm_review", "edit_foldback", "adaptive", "drift_check", "lessons", "lesson_guard", "clock_tick_backoff", "deliver_review", "round_replan", "step_replan", "show_to_user"}
 
 REVIEW_SYSTEM = (
     "你是 AI 编码代理的独立行为审查员。主代理看不到你的存在,你只依据给它的任务描述"
@@ -312,7 +337,7 @@ def take_review_results(state, cfg, now):
         if res.get("verdict") == "error":
             _safe_rm(p)  # 失败不注入，静默丢弃（可观测性靠 watcher.log）
             continue
-        texts.append(format_review_result(res, max(0, steps_back)))
+        texts.append(format_review_result(res, max(0, steps_back), cfg))
         _safe_rm(p)
     return texts
 
@@ -324,7 +349,7 @@ def _safe_rm(path):
         pass
 
 
-def format_review_result(res, steps_back):
+def format_review_result(res, steps_back, cfg=None):
     """把结论格式化成注入文本。必须标注场景，不能只说'N 步前'。"""
     label = VERDICT_LABEL.get(res.get("verdict", ""), res.get("verdict", ""))
     lines = [
@@ -334,6 +359,9 @@ def format_review_result(res, steps_back):
         "收束建议: " + (res.get("suggestion") or "(未给出)"),
         "请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。",
     ]
+    rl = report_line(cfg) if cfg is not None else ""
+    if rl:
+        lines.append(rl)
     return "\n".join(lines)
 
 
@@ -408,7 +436,7 @@ def _lessons_alive(lessons, ttl_days):
             if isinstance(e, dict) and e.get("last_seen", 0) >= deadline]
 
 
-def register_lesson(pattern, correction, cfg=None):
+def register_lesson(pattern, correction, cfg=None, raw=""):
     """登记/累加一条坑位教训;同模式合并,hits 记录被踩次数。
     写入时顺带按 TTL 淘汰过期坑位,账本不会只增不减。"""
     if not pattern:
@@ -420,21 +448,59 @@ def register_lesson(pattern, correction, cfg=None):
     except Exception:
         lessons = []
     lessons = _lessons_alive(lessons, (cfg or {}).get("lessons_ttl_days", 0))
+    clean_raw = raw_cmd(raw) if raw else ""
     for entry in lessons:
         if entry.get("pattern") == pattern:
             entry["hits"] = entry.get("hits", 1) + 1
             entry["correction"] = correction
             entry["last_seen"] = time.time()
+            if clean_raw:
+                entry["last_raw"] = clean_raw
             break
     else:
-        lessons.append({"pattern": pattern, "correction": correction,
-                        "hits": 1, "last_seen": time.time()})
+        item = {"pattern": pattern, "correction": correction,
+                "hits": 1, "last_seen": time.time()}
+        if clean_raw:
+            item["last_raw"] = clean_raw
+        lessons.append(item)
     lessons.sort(key=lambda e: -e.get("hits", 1))
     try:
         with open(lessons_path(), "w", encoding="utf-8") as f:
             json.dump(lessons[:50], f, ensure_ascii=False, indent=1)
     except Exception:
         pass
+
+
+def check_lesson_guard(cmd, cfg=None):
+    """命令执行前对照教训登记簿:
+      - 原样命令(last_raw)再次执行,或同一模式累计失败循环 >= lesson_guard_hits 次 → ("block", entry)
+      - 仅归一化模式命中但已改过参数/脚本序号且未达硬拦截阈值 → ("warn", entry)
+      - 未命中或开关关闭 → (None, None)
+    """
+    cfg = cfg or {}
+    if not cfg.get("enabled", True) or not cfg.get("lessons", True) or not cfg.get("lesson_guard", True):
+        return None, None
+    n = norm_cmd(cmd)
+    r = raw_cmd(cmd)
+    if not n and not r:
+        return None, None
+    try:
+        with open(lessons_path(), encoding="utf-8") as f:
+            lessons = json.load(f)
+        alive = _lessons_alive(lessons if isinstance(lessons, list) else [],
+                               cfg.get("lessons_ttl_days", 0))
+    except Exception:
+        return None, None
+    guard_hits = max(1, int(cfg.get("lesson_guard_hits", 2)))
+    for entry in alive:
+        last_raw = entry.get("last_raw") or ""
+        if r and last_raw and r == last_raw:
+            return "block", entry
+        if n and entry.get("pattern") == n:
+            if entry.get("hits", 1) >= guard_hits:
+                return "block", entry
+            return "warn", entry
+    return None, None
 
 
 def top_lessons(n=3, cfg=None):
@@ -465,12 +531,20 @@ def lessons_text(state, cfg=None):
     return "\n".join(lines)
 
 
+def _extract_path(ti):
+    if not isinstance(ti, dict):
+        return ""
+    for k in _PATH_KEYS:
+        v = ti.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
 def record_edit_hash(state, cfg, data):
     """记录 Edit/Write 后文件内容的短 hash;内容回到先前见过的状态 → 折返(返回 True)。"""
     ti = data.get("tool_input") or data.get("toolInput") or {}
-    if not isinstance(ti, dict):
-        return False
-    path = ti.get("file_path") or ti.get("path") or ti.get("notebook_path")
+    path = _extract_path(ti)
     if not path:
         return False
     path = os.path.abspath(str(path))
@@ -716,6 +790,7 @@ class state_lock(object):
         self.token = "%d:%s" % (os.getpid(), uuid.uuid4().hex)
         self.acquired = False
         self.degraded = False     # True = 超时后无锁执行（会丢更新，仅保可用性）
+        self._os_locked = False   # True = 真正持有内核文件锁（区分 stale 超时接管）
         self._fd = None           # 持锁期间保持打开；进程死亡由内核释放锁
         self._hb_stop = threading.Event()
         self._hb_thread = None
@@ -781,6 +856,7 @@ class state_lock(object):
         else:
             import fcntl
             fcntl.flock(self._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self._os_locked = True
 
     def _is_stale(self):
         """只有心跳超时才算失效；进程死亡由 OS 锁自动释放，不靠 PID 猜测。"""
@@ -823,18 +899,19 @@ class state_lock(object):
             return False
         self._stop_heartbeat()               # ★ v0.8：先停心跳，再删锁
         fd, self._fd = self._fd, None
+        was_os_locked, self._os_locked = self._os_locked, False
         if fd is not None:
-            try:
-                os.lseek(fd, self.LOCK_OFFSET, os.SEEK_SET)
-                if os.name == "nt":
-                    import msvcrt
-                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-                else:
-                    import fcntl
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                # 被 stale 接管的路径本来就没拿到 OS 锁；关句柄即可。
-                pass
+            if was_os_locked:
+                try:
+                    os.lseek(fd, self.LOCK_OFFSET, os.SEEK_SET)
+                    if os.name == "nt":
+                        import msvcrt
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
             try:
                 os.close(fd)
             except OSError:
@@ -870,7 +947,7 @@ def extract_cmd(data):
     if isinstance(ti, str):
         return ti.strip()
     if isinstance(ti, dict):
-        for k in ("command", "cmd", "script"):
+        for k in _CMD_KEYS:
             v = ti.get(k)
             if isinstance(v, str):
                 return v
@@ -882,13 +959,16 @@ SCRIPT_RX = re.compile(r"\.(?:" + "|".join(map(re.escape, _SCRIPT_EXTS)) + r")$"
 INTERPRETERS = set(_SPEC.get("interpreters",
                              ["python", "python3", "py", "node", "bash", "sh", "pwsh", "powershell", "perl", "ruby"]))
 SEQ_RX = re.compile(r"[\d_-]+(?=\.\w+$)")
+_INLINE_FLAGS = {"-c", "-m", "-e", "-p", "--eval", "--print"}
 
 
 def norm_cmd(cmd):
     """把一条命令归一化成"程序 + 目标主体",用于识别换汤不换药的重复执行。
 
-    python _peek2.py / python _peek3.py  →  "python _peek.py"   (判定重复)
-    grep -rn "foo" a / grep -rn "bar" b  →  不同                (不判重复)
+    python _peek2.py / python _peek3.py      →  "python _peek.py"         (判定重复)
+    python -u _peek2.py                      →  "python _peek.py"         (跳过解释器 flag)
+    python manage.py migrate / manage.py test → "python manage.py migrate" (无序号入口脚本保留子命令)
+    grep -rn "foo" a / grep -rn "bar" b      →  不同                      (不判重复)
     """
     s = (cmd or "").strip().lower()
     if not s:
@@ -903,9 +983,25 @@ def norm_cmd(cmd):
     head = re.sub(r"\.exe$", "", head)
 
     if head in INTERPRETERS and len(toks) > 1:
-        second = toks[1].replace("\\", "/").split("/")[-1].strip("\"'")
-        if SCRIPT_RX.search(second):
-            return (head + " " + SEQ_RX.sub("", second)).strip()
+        idx = 1
+        while idx < len(toks):
+            t_clean = toks[idx].strip("\"'")
+            if t_clean in _INLINE_FLAGS:
+                return s  # -c / -m 等内联或模块执行不截断
+            if t_clean.startswith("-"):
+                idx += 1
+                continue
+            break
+        if idx < len(toks):
+            second = toks[idx].replace("\\", "/").split("/")[-1].strip("\"'")
+            if SCRIPT_RX.search(second):
+                stripped = SEQ_RX.sub("", second)
+                has_seq = stripped != second
+                rest = [t.strip("\"'") for t in toks[idx + 1:]]
+                subcmds = [t for t in rest if t and not t.startswith("-")]
+                if not has_seq and subcmds:
+                    return (head + " " + stripped + " " + " ".join(subcmds)).strip()
+                return (head + " " + stripped).strip()
         return s   # 非脚本形态不截断:任何 token 截断都会制造误报(-c 脚本/build2/git 分支)
 
     return s
@@ -1016,18 +1112,18 @@ def nudge_text(state, cfg, now, specific):
     lines = [
         "🔔 【AI 抬头 · 中途自我审查】时钟 {h},本段 {m:.0f} 分钟/{c} 次调用,修改 {e} 次。停一下,自查:".format(
             h=local_hm(now), m=mins,
-            c=max(0, state["tool_calls"]
-                  - state.get("calls_at_stretch_start", state["tool_calls"] - state["calls_since_reminder"])),
+            c=state["calls_since_reminder"],
             e=state["edits_since_reminder"]),
         "① 对照最初目标是否偏移?② 最近 5 次调用有无新信息?若无 → 正在空跑。",
     ]
     if specific:
         lines.append("③ " + specific)
     lines.append("→ 一句话结论:继续 / 换方法 / 先向用户汇报,然后再继续。")
-    if state.get("reminders", 0) >= 3:
+    next_rem = state.get("reminders", 0) + 1
+    if next_rem >= cfg.get("escalate_after_reminders", 3):
         lines.append(
             "⚠️ 第 {n} 次提醒仍无改善——停止当前方法,直接向用户汇报卡点。".format(
-                n=state["reminders"] + 1))
+                n=next_rem))
     rl = report_line(cfg)
     if rl:
         lines.append(rl)
@@ -1074,11 +1170,14 @@ def replan_text(rounds, steps, cfg):
 
 def brief_of(data, tool):
     """结构化参数摘要:Bash 取命令,文件类工具取路径,其余取参数 JSON 前段。"""
-    if tool == "Bash":
+    if is_shell_tool(tool):
         return extract_cmd(data)[:100]
     ti = data.get("tool_input") or data.get("toolInput") or {}
     if isinstance(ti, dict):
-        for k in ("file_path", "path", "notebook_path", "url", "query"):
+        p = _extract_path(ti)
+        if p:
+            return p[:100]
+        for k in ("url", "query"):
             if ti.get(k):
                 return str(ti[k])[:100]
         try:
@@ -1234,6 +1333,64 @@ def stop_output(reason):
     return {"decision": "block", "reason": reason}
 
 
+def pre_use_block_output(reason, cfg=None):
+    out = {
+        "decision": "block",
+        "reason": reason,
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+    }
+    if cfg is not None and cfg.get("show_to_user"):
+        out["systemMessage"] = reason.split("\n", 1)[0]
+    return out
+
+
+def pre_use_warn_output(text, cfg=None):
+    out = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": text,
+        }
+    }
+    if cfg is not None and cfg.get("show_to_user"):
+        out["systemMessage"] = text.split("\n", 1)[0]
+    return out
+
+
+def handle_pre_use(cfg, data, state, now):
+    state["last_event_at"] = now
+    tool = str(data.get("tool_name") or data.get("toolName") or "Unknown")
+    if not is_shell_tool(tool):
+        return None
+    cmd = extract_cmd(data)
+    action_kind, entry = check_lesson_guard(cmd, cfg)
+    if not action_kind or not entry:
+        return None
+    pat = entry.get("pattern", "")
+    hits = entry.get("hits", 1)
+    corr = entry.get("correction", "")
+    if action_kind == "block":
+        lines = [
+            "🛑 【AI 抬头 · 坑位拦截】命令命中已登记 {h} 次的失败坑位 `{p}`，已阻止重复执行。".format(
+                h=hits, p=pat),
+            "历史教训: " + corr,
+            "请先修改命令参数/脚本逻辑或换一种方法；若确需绕过，请先向用户说明根因。",
+        ]
+        rl = report_line(cfg)
+        if rl:
+            lines.append(rl)
+        return pre_use_block_output("\n".join(lines), cfg)
+    lines = [
+        "⚠️ 【AI 抬头 · 坑位预警】该命令归一化模式 `{p}` 曾触发失败循环({h} 次)。".format(
+            p=pat, h=hits),
+        "历史教训: " + corr,
+    ]
+    return pre_use_warn_output("\n".join(lines), cfg)
+
+
 def handle_post_use(cfg, data, state, now):
     if now - state.get("last_event_at", now) > STALE_AFTER_SEC:
         reset_stretch(state, cfg, now)
@@ -1262,14 +1419,14 @@ def handle_post_use(cfg, data, state, now):
             return post_use_output(carried + "\n" + text, cfg)
         return post_use_output(text, cfg)
 
-    if tool in PRODUCTIVE_TOOLS:
+    if is_productive_tool(tool):
         state["edits"] += 1
         state["edits_since_reminder"] += 1
         if cfg["edit_foldback"] and record_edit_hash(state, cfg, data):
             state["foldback_hit"] = True
             ti = data.get("tool_input") or data.get("toolInput") or {}
-            state["foldback_path"] = str((ti.get("file_path") or ti.get("path") or ti.get("notebook_path") or "?"))[:120]
-    elif tool == "Bash":
+            state["foldback_path"] = (_extract_path(ti) or "?")[:120]
+    elif is_shell_tool(tool):
         cmd = extract_cmd(data)
         n = norm_cmd(cmd)
         r = raw_cmd(cmd)
@@ -1441,12 +1598,20 @@ def handle_post_fail(cfg, data, state, now):
     state["last_event_at"] = now
     state["fail_streak"] += 1
     state["total_failures"] += 1
+    pending_verdicts = take_review_results(state, cfg, now) if cfg.get("deliver_review") else []
+    carried = "\n".join(pending_verdicts) if pending_verdicts else ""
+
+    def emit_fail(t):
+        if carried:
+            return post_fail_output(carried + "\n" + t, cfg)
+        return post_fail_output(t, cfg)
+
     log = state.get("recent_log", [])
     log.append({"tool": str(data.get("tool_name") or data.get("toolName") or "Unknown"),
                 "brief": brief_of(data, str(data.get("tool_name") or data.get("toolName") or "Unknown")), "ok": False})
     state["recent_log"] = log[-max(cfg["review_log_floor"], cfg["review_log_size"]):]
     if state["fail_streak"] < cfg["fail_streak_threshold"]:
-        return None
+        return post_fail_output(carried, cfg) if carried else None
     # ★ v0.8:fail-loop 收编进 fire()。此前这里是手工复刻的整套状态维护,
     #   漏抄了 3 项(F1)。现在前置门槛(连败阈值)留在这里,其余全部交给 fire()。
     #   冷却基准用 last_fail_reminder_at(独立于其它触发器),故 cooldown_key
@@ -1465,10 +1630,10 @@ def handle_post_fail(cfg, data, state, now):
         cooldown_key="last_fail_reminder_at",
     )
     if not text:
-        return None
-    if state.get("reminders", 0) >= 3:
+        return post_fail_output(carried, cfg) if carried else None
+    if state.get("reminders", 0) >= cfg.get("escalate_after_reminders", 3):
         text += "\n⚠️ 这已是本会话第 {n} 次提醒。请考虑完全放弃当前路径,直接向用户汇报。".format(
-            n=state["reminders"] + 1)
+            n=state["reminders"])
     rl = report_line(cfg)
     if rl:
         text += "\n" + rl
@@ -1480,11 +1645,12 @@ def handle_post_fail(cfg, data, state, now):
             register_lesson(
                 norm_cmd(last_fail.get("brief", "")) or "未知模式",
                 "连续失败 {n} 次后被打断——换方法前请先读错误定位根因,勿重复此方式".format(n=streak),
-                cfg)
-    return post_fail_output(finalize_text(
+                cfg,
+                raw=last_fail.get("brief", ""))
+    return emit_fail(finalize_text(
         state, cfg, now, "fail-loop",
         "连续失败 {n} 次".format(n=streak),
-        text), cfg)
+        text))
 
 
 def handle_prompt(cfg, data, state, now):
@@ -1658,7 +1824,9 @@ def main():
         state = load_state(sid, now)
 
         out = None
-        if action == "post-use":
+        if action == "pre-use":
+            out = handle_pre_use(cfg, data, state, now)
+        elif action == "post-use":
             out = handle_post_use(cfg, data, state, now)
         elif action == "post-fail":
             out = handle_post_fail(cfg, data, state, now)

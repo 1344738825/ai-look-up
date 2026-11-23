@@ -362,6 +362,22 @@ verify(
     [PY, os.path.join(HERE, "golden_check.py")],
 )
 
+verify(
+    "Python: handle_post_fail 漏取回第三通道结论（连续失败时死锁滞留）",
+    HOOK,
+    'def handle_post_fail(cfg, data, state, now):\n'
+    '    state["last_event_at"] = now\n'
+    '    state["fail_streak"] += 1\n'
+    '    state["total_failures"] += 1\n'
+    '    pending_verdicts = take_review_results(state, cfg, now) if cfg.get("deliver_review") else []',
+    'def handle_post_fail(cfg, data, state, now):\n'
+    '    state["last_event_at"] = now\n'
+    '    state["fail_streak"] += 1\n'
+    '    state["total_failures"] += 1\n'
+    '    pending_verdicts = []',
+    [PY, os.path.join(HERE, "channel_check.py")],
+)
+
 # ═══════════════════════════════════════════════════════════════════════════
 print()
 proven = sum(1 for _, good, _ in results if good is True)

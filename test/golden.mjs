@@ -49,6 +49,7 @@ const KEY_MAP = {
   drift_check_calls: 'driftCheckCalls',
   drift_cooldown_sec: 'driftCooldownSec',
   lessons_ttl_days: 'lessonsTtlDays',
+  lesson_guard_hits: 'lessonGuardHits',
   round_replan_rounds: 'roundReplanRounds',
   round_replan_min_calls: 'roundReplanMinCalls',
   step_replan_calls: 'stepReplanCalls',
@@ -506,6 +507,19 @@ check('behavior interpreters/scriptExtensions（normCmd 随 spec 集合变）', 
   assert.equal(__test.normCmd('unknownbin a1.py'), 'unknownbin a1.py');
   assert.equal(__test.normCmd('python a1.mjs'), 'python a.mjs');
   assert.equal(__test.normCmd('python a1.noext'), 'python a1.noext');
+});
+
+check('behavior lessonGuardHits（阈值 2：hits=2 硬拦截 / hits=1 仅软预警）', () => {
+  __test.lessonsLedger.clear();
+  __test.registerLesson('python guard_probe.py', 'c');
+  const warnRes = __test.checkLessonGuard('python guard_probe.py --new',
+    { ...__test.defaults, lessonGuard: true, lessonGuardHits: 2 });
+  assert.equal(warnRes?.action, 'warn', 'hits=1 < 2 应为软预警');
+  __test.registerLesson('python guard_probe.py', 'c');
+  const blockRes = __test.checkLessonGuard('python guard_probe.py --new',
+    { ...__test.defaults, lessonGuard: true, lessonGuardHits: 2 });
+  assert.equal(blockRes?.action, 'block', 'hits=2 >= 2 应为硬拦截');
+  __test.lessonsLedger.clear();
 });
 
 await Promise.all(pending);

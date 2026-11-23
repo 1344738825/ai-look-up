@@ -30,12 +30,13 @@ CORE = os.path.abspath(os.path.join(HERE, "..", "..", "hooks", "lookup_hook.py")
 
 EVENT_TO_ACTION = {
     "UserPromptSubmit": "prompt",
+    "PreToolUse": "pre-use",
     "PostToolUse": "post-use",
     "PostToolUseFailure": "post-fail",
     "Stop": "stop",
 }
 
-VALID_ACTIONS = ("prompt", "post-use", "post-fail", "stop")
+VALID_ACTIONS = ("prompt", "pre-use", "post-use", "post-fail", "stop")
 
 
 def read_stdin():

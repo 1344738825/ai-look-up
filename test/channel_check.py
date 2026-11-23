@@ -335,6 +335,21 @@ def t_realpath_with_trigger():
 check("真实路径:结论+提醒同事件各自恰好一次(emit 递归回归)", t_realpath_with_trigger)
 
 
+def t_post_fail_retrieves_verdict():
+    clean_channel()
+    st, now = fresh_state(reminders=5, tool_calls=42, prompt_resets=1, fail_streak=0)
+    rid = H.deliver_review_request(BASE_CFG, st, now, "fail-loop", "连续失败 3 次")
+    assert rid
+    _stub_result(rid)
+    data = {"tool_name": "Bash", "tool_input": {"command": "python fail_again.py"}}
+    out = H.handle_post_fail(BASE_CFG, data, st, now + 5)
+    assert out is not None, "连续失败事件(handle_post_fail)也必须取回并注入第三通道结论"
+    t = _out_text(out)
+    assert "独立审查者" in t and "有偏航迹象" in t, t
+    assert "呈报" in t, "show_to_user=True 时第三通道结论必须附呈报指令: " + t
+check("真实路径:handle_post_fail 取回第三通道结论并附呈报指令", t_post_fail_retrieves_verdict)
+
+
 shutil.rmtree(SANDBOX, ignore_errors=True)
 print()
 if FAILS:

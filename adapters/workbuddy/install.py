@@ -32,7 +32,15 @@ CLIENTS = {
     "codebuddy": os.path.join(os.path.expanduser("~"), ".codebuddy", "settings.json"),
 }
 
-TIMEOUTS = {"UserPromptSubmit": 15, "PostToolUse": 15, "PostToolUseFailure": 15, "Stop": 20}
+TIMEOUTS = {
+    "UserPromptSubmit": 15,
+    "PreToolUse": 15,
+    "PostToolUse": 15,
+    "PostToolUseFailure": 15,
+    "Stop": 20,
+}
+
+MARKER = "lookup_wb_adapter.py"
 
 
 def slash(p):
@@ -52,6 +60,42 @@ def build_hooks(python_exe, adapter):
             }]
         }]
     return hooks
+
+
+def _is_our_group(group):
+    """判断一条 hook group 是否属于 ai-look-up(按命令或描述识别)。"""
+    if not isinstance(group, dict):
+        return False
+    inner = group.get("hooks")
+    if isinstance(inner, list):
+        for h in inner:
+            if isinstance(h, dict):
+                cmd = str(h.get("command") or "")
+                desc = str(h.get("description") or "")
+                if MARKER in cmd or desc.startswith("ai-look-up:"):
+                    return True
+    cmd = str(group.get("command") or "")
+    return MARKER in cmd
+
+
+def merge_hooks(existing_hooks, new_hooks):
+    """按事件名增量合并 hooks:保留用户的其他事件与其他插件钩子,仅原地更新 ai-look-up 条目。"""
+    merged = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    replaced = 0
+    for event, our_groups in new_hooks.items():
+        cur_list = merged.get(event)
+        if not isinstance(cur_list, list):
+            merged[event] = list(our_groups)
+            continue
+        kept = []
+        for g in cur_list:
+            if _is_our_group(g):
+                replaced += 1
+            else:
+                kept.append(g)
+        kept.extend(our_groups)
+        merged[event] = kept
+    return merged, replaced
 
 
 def detect_clients():
@@ -112,7 +156,8 @@ def install(client, python_exe, adapter, dry_run=False):
 
     cfg = load_json(path)
     had = cfg.get("hooks")
-    cfg["hooks"] = build_hooks(python_exe, adapter)
+    our_hooks = build_hooks(python_exe, adapter)
+    cfg["hooks"], replaced = merge_hooks(had, our_hooks)
 
     if dry_run:
         print(json.dumps(cfg["hooks"], ensure_ascii=False, indent=2))
@@ -136,7 +181,7 @@ def install(client, python_exe, adapter, dry_run=False):
     load_json(path)  # 回读校验
     print("  写入 OK,顶层键 %d 个,hooks 事件 %s%s" % (
         len(cfg), "/".join(cfg["hooks"]),
-        "" if had is None else "(覆盖了原有的 hooks)",
+        "" if not replaced else " (增量更新了 %d 条已有 ai-look-up 钩子,保留其余钩子)" % replaced,
     ))
     return True
 

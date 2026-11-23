@@ -15,8 +15,12 @@
  *   - 通过子进程回调 Python 核心,保持"一份核心逻辑"——本文件不含任何检测逻辑。
  */
 
-const REPO = process.env.AI_LOOK_UP_REPO || 'REPLACE_WITH_REPO_PATH';
-const CORE = REPO + '/hooks/lookup_hook.py';
+import { fileURLToPath } from 'node:url';
+import { dirname, join } from 'node:path';
+
+const DEFAULT_REPO = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const REPO = process.env.AI_LOOK_UP_REPO || DEFAULT_REPO;
+const CORE = join(REPO, 'hooks', 'lookup_hook.py');
 const PYTHON = process.env.AI_LOOK_UP_PYTHON || 'python';
 
 let sessionId = 'opencode-' + Date.now().toString(36);
@@ -59,6 +63,26 @@ export const AiLookUpAdapter = async ({ project }) => {
   // session 标识:用会话目录区分,保证状态文件不串
   sessionId = 'opencode-' + (project || 'default').replace(/[^A-Za-z0-9_.-]/g, '_').slice(-80);
   return {
+    'chat.message': async (event) => {
+      const prompt = event?.text || event?.prompt || '';
+      const out = await callCore('prompt', { session_id: sessionId, prompt });
+      if (out) console.error('[ai-look-up] ' + out);
+    },
+    'tool.execute.before': async (input) => {
+      const payload = toCorePayload(input, null);
+      const out = await callCore('pre-use', payload);
+      if (out) {
+        try {
+          const obj = JSON.parse(out);
+          if (obj?.decision === 'block') {
+            throw new Error(obj.reason || 'Blocked by ai-look-up lesson guard');
+          }
+        } catch (err) {
+          if (err instanceof Error && err.message.includes('AI 抬头')) throw err;
+        }
+        console.error('[ai-look-up] ' + out);
+      }
+    },
     'tool.execute.after': async (input, output) => {
       const payload = toCorePayload(input, output);
       const out = await callCore(payload._error ? 'post-fail' : 'post-use', payload);
@@ -68,6 +92,10 @@ export const AiLookUpAdapter = async ({ project }) => {
         console.error('[ai-look-up] ' + out);
       }
       return output;
+    },
+    'session.idle': async () => {
+      const out = await callCore('stop', { session_id: sessionId });
+      if (out) console.error('[ai-look-up] ' + out);
     },
   };
 };

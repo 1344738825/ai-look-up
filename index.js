@@ -25,6 +25,28 @@ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync
 import { tmpdir } from 'node:os';
 
 const PRODUCTIVE_TOOLS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'ApplyPatch']);
+const PRODUCTIVE_ALIASES = new Set([
+  'edit', 'write', 'multiedit', 'notebookedit', 'applypatch',
+  'write_file', 'edit_file', 'create_file', 'replace_file_content',
+  'multi_replace_file_content', 'str_replace_editor',
+  'str_replace_based_edit_tool', 'patch', 'file_edit', 'file_write',
+]);
+const SHELL_ALIASES = new Set([
+  'bash', 'run_command', 'run_shell_command', 'execute_command',
+  'shell', 'terminal', 'cmd',
+]);
+const PATH_KEYS = ['file_path', 'path', 'notebook_path', 'TargetFile', 'target_file', 'Path', 'filePath'];
+const CMD_KEYS = ['command', 'cmd', 'script', 'CommandLine', 'command_line'];
+
+const isProductiveTool = (tool) => {
+  const t = String(tool ?? '');
+  return PRODUCTIVE_TOOLS.has(t) || PRODUCTIVE_ALIASES.has(t.toLowerCase());
+};
+
+const isShellTool = (tool) => {
+  const t = String(tool ?? '');
+  return t === 'Bash' || SHELL_ALIASES.has(t.toLowerCase());
+};
 
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -59,6 +81,7 @@ const KEY_MAP = {
   drift_check_calls: 'driftCheckCalls',
   drift_cooldown_sec: 'driftCooldownSec',
   lessons_ttl_days: 'lessonsTtlDays',
+  lesson_guard_hits: 'lessonGuardHits',
   round_replan_rounds: 'roundReplanRounds',
   round_replan_min_calls: 'roundReplanMinCalls',
   step_replan_calls: 'stepReplanCalls',
@@ -140,6 +163,9 @@ const DEFAULTS = {
   // lesson TTL (v0.8.4): pitfalls not re-hit within N days are dropped; 0 = keep forever.
   // Without it, dev-time test data occupies injection slots forever by hits ranking.
   lessonsTtlDays: 7,
+  // pre-execution lesson guard: block exact repeat of a failing command or pattern hit >= lessonGuardHits
+  lessonGuard: true,
+  lessonGuardHits: 2,
   // ── 第三通道:投递请求 + 独立 watcher（v0.7）──
   // deliverReview 默认关:它要花用户自己的 API 额度,只有显式开启才投递。
   deliverReview: false,
@@ -187,17 +213,41 @@ const adaptiveStats = new Map();
  */
 const lessonsLedger = new Map();
 
-function registerLesson(pattern, correction) {
+function registerLesson(pattern, correction, raw = '') {
   if (!pattern) return;
   const now = Date.now();
+  const cleanRaw = raw ? rawCmd(raw) : '';
   const prev = lessonsLedger.get(pattern);
   if (prev) {
     prev.hits += 1;
     prev.correction = correction;
     prev.lastSeen = now;
+    if (cleanRaw) prev.lastRaw = cleanRaw;
   } else {
-    lessonsLedger.set(pattern, { pattern, correction, hits: 1, lastSeen: now });
+    lessonsLedger.set(pattern, { pattern, correction, hits: 1, lastSeen: now, lastRaw: cleanRaw });
   }
+}
+
+function checkLessonGuard(cmd, cfg = null) {
+  const c = cfg ?? DEFAULTS;
+  if (!c.enabled || !c.lessons || !c.lessonGuard) return null;
+  const n = normCmd(cmd);
+  const r = rawCmd(cmd);
+  if (!n && !r) return null;
+  const ttlDays = c.lessonsTtlDays || 0;
+  const deadline = ttlDays > 0 ? Date.now() - ttlDays * 86400000 : 0;
+  const alive = [...lessonsLedger.values()].filter((e) => !deadline || (e.lastSeen || 0) >= deadline);
+  const guardHits = Math.max(1, Number(c.lessonGuardHits ?? 2));
+  for (const entry of alive) {
+    if (r && entry.lastRaw && r === entry.lastRaw) {
+      return { action: 'block', entry };
+    }
+    if (n && entry.pattern === n) {
+      if ((entry.hits || 1) >= guardHits) return { action: 'block', entry };
+      return { action: 'warn', entry };
+    }
+  }
+  return null;
 }
 
 function lessonsMessage(state, force = false, cfg = null) {
@@ -260,6 +310,7 @@ const _escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const SCRIPT_RX = new RegExp('\\.(?:' + (SPEC.script_extensions ?? ['py', 'js', 'ts', 'mjs', 'cjs', 'sh', 'ps1', 'bat']).map(_escapeRe).join('|') + ')$', 'i');
 const INTERPRETERS = new Set(SPEC.interpreters ?? ['python', 'python3', 'py', 'node', 'bash', 'sh', 'pwsh', 'powershell', 'perl', 'ruby']);
 const SEQ_RX = /[\d_-]+(?=\.\w+$)/;
+const INLINE_FLAGS = new Set(['-c', '-m', '-e', '-p', '--eval', '--print']);
 
 function normCmd(cmd) {
   let s = String(cmd ?? '').trim().toLowerCase();
@@ -275,8 +326,26 @@ function normCmd(cmd) {
 
   // 解释器 + 脚本文件:归一化脚本名里的序号(_peek2.py → _peek.py)
   if (INTERPRETERS.has(head) && toks.length > 1) {
-    const second = (toks[1] ?? '').replace(/\\/g, '/').split('/').pop().replace(/^["']|["']$/g, '');
-    if (SCRIPT_RX.test(second)) return (head + ' ' + second.replace(SEQ_RX, '')).trim();
+    let idx = 1;
+    while (idx < toks.length) {
+      const tClean = (toks[idx] ?? '').replace(/^["']|["']$/g, '');
+      if (INLINE_FLAGS.has(tClean)) return s; // -c / -m 等内联或模块执行不截断
+      if (tClean.startsWith('-')) { idx += 1; continue; }
+      break;
+    }
+    if (idx < toks.length) {
+      const second = (toks[idx] ?? '').replace(/\\/g, '/').split('/').pop().replace(/^["']|["']$/g, '');
+      if (SCRIPT_RX.test(second)) {
+        const stripped = second.replace(SEQ_RX, '');
+        const hasSeq = stripped !== second;
+        const rest = toks.slice(idx + 1).map((t) => t.replace(/^["']|["']$/g, ''));
+        const subcmds = rest.filter((t) => t && !t.startsWith('-'));
+        if (!hasSeq && subcmds.length) {
+          return (head + ' ' + stripped + ' ' + subcmds.join(' ')).trim();
+        }
+        return (head + ' ' + stripped).trim();
+      }
+    }
     return s;   // 非脚本形态不截断:任何 token 截断都会制造误报(-c 脚本/build2/git 分支)
   }
   return s;
@@ -288,9 +357,17 @@ function extractCmd(exec) {
   const input = exec?.input ?? exec?.arguments ?? exec?.args ?? exec?.toolInput;
   if (typeof input === 'string') return input;
   if (input && typeof input === 'object') {
-    for (const key of ['command', 'cmd', 'script']) {
+    for (const key of CMD_KEYS) {
       if (typeof input[key] === 'string') return input[key];
     }
+  }
+  return '';
+}
+
+function extractPath(input) {
+  if (!input || typeof input !== 'object') return '';
+  for (const key of PATH_KEYS) {
+    if (input[key]) return String(input[key]);
   }
   return '';
 }
@@ -303,10 +380,12 @@ function toolNameOf(exec) {
 }
 
 function briefOf(exec, cmd, tool) {
-  if (tool === 'Bash' && cmd) return cmd.slice(0, 100);
+  if (isShellTool(tool) && cmd) return cmd.slice(0, 100);
   const input = exec?.input ?? exec?.arguments ?? exec?.args ?? exec?.toolInput;
   if (input && typeof input === 'object') {
-    for (const key of ['file_path', 'path', 'notebook_path', 'url', 'query']) {
+    const p = extractPath(input);
+    if (p) return p.slice(0, 100);
+    for (const key of ['url', 'query']) {
       if (input[key]) return String(input[key]).slice(0, 100);
     }
   }
@@ -460,7 +539,7 @@ function evaluatePending(state, cfg) {
 function recordEditHash(state, cfg, exec) {
   const input = exec?.input ?? exec?.arguments ?? exec?.args ?? exec?.toolInput;
   if (!input || typeof input !== 'object') return null;
-  const rawPath = input.file_path ?? input.path ?? input.notebook_path;
+  const rawPath = extractPath(input);
   if (!rawPath) return null;
   const path = String(rawPath);
   let hash = '';
@@ -490,8 +569,9 @@ function nudgeText(state, cfg, now, specific) {
   ];
   if (specific) lines.push('③ ' + specific);
   lines.push('→ 一句话结论:继续 / 换方法 / 先向用户汇报,然后再继续。');
-  if (state.reminders >= 3) {
-    lines.push('⚠️ 第 ' + (state.reminders + 1) + ' 次提醒仍无改善——停止当前方法,直接向用户汇报卡点。');
+  const nextRem = state.reminders + 1;
+  if (nextRem >= cfg.escalateAfterReminders) {
+    lines.push('⚠️ 第 ' + nextRem + ' 次提醒仍无改善——停止当前方法,直接向用户汇报卡点。');
   }
   const rl = reportLine(cfg);
   if (rl) lines.push(rl);
@@ -694,15 +774,18 @@ function deliverReviewRequest(cfg, st, now, kind, detail) {
 }
 
 /** 把结论格式化成注入文本。必须标注场景,不能只说"N 步前"。 */
-function formatReviewResult(res, stepsBack) {
+function formatReviewResult(res, stepsBack, cfg = null) {
   const label = VERDICT_LABEL[res.verdict] ?? res.verdict ?? '';
-  return [
+  const lines = [
     '🎯 【AI 抬头 · 独立审查者】判定: ' + label,
     '该结论基于 ' + stepsBack + ' 步前「' + ((res.detail || '未知触发') + '').slice(0, 60) + '」的现场。',
     '漂移表现: ' + (res.reason || '(未给出)'),
     '收束建议: ' + (res.suggestion || '(未给出)'),
     '请对照最初任务,决定:把当前子任务收敛回主线 / 明确其为目标之一并告知用户 / 放弃。',
-  ].join('\n');
+  ];
+  const rl = cfg ? reportLine(cfg) : '';
+  if (rl) lines.push(rl);
+  return lines.join('\n');
 }
 
 /**
@@ -733,7 +816,7 @@ function takeReviewResults(st, cfg, now) {
     const stepsBack = st.toolCalls - Number(res.tool_calls ?? 0);
     if (stepsBack > cfg.resultSettleCalls) { safeUnlink(p); continue; }
     if (res.verdict === 'error') { safeUnlink(p); continue; }  // 失败不注入,静默丢弃
-    texts.push(formatReviewResult(res, Math.max(0, stepsBack)));
+    texts.push(formatReviewResult(res, Math.max(0, stepsBack), cfg));
     safeUnlink(p);
   }
   return texts;
@@ -873,6 +956,36 @@ export function apply(ctx, config) {
     }
   });
 
+  const guardExec = (exec) => {
+    const tool = toolNameOf(exec);
+    if (!isShellTool(tool)) return null;
+    const hit = checkLessonGuard(extractCmd(exec), cfg);
+    if (!hit) return null;
+    const { action, entry } = hit;
+    if (action === 'block') {
+      const reason = [
+        '🛑 【AI 抬头 · 坑位拦截】命令命中已登记 ' + entry.hits + ' 次的失败坑位 `' + entry.pattern + '`，已阻止重复执行。',
+        '历史教训: ' + (entry.correction || ''),
+        '请先修改命令参数/脚本逻辑或换一种方法；若确需绕过，请先向用户说明根因。',
+        reportLine(cfg),
+      ].filter(Boolean).join('\n');
+      return { decision: 'block', reason };
+    }
+    if (action === 'warn' && exec?.agent) {
+      deliver(exec.agent, ctx, [
+        '⚠️ 【AI 抬头 · 坑位预警】该命令归一化模式 `' + entry.pattern + '` 曾触发失败循环(' + entry.hits + ' 次)。',
+        '历史教训: ' + (entry.correction || ''),
+      ].join('\n'));
+    }
+    return null;
+  };
+  try {
+    if (typeof ctx?.tools?.guard === 'function') {
+      ctx.tools.guard((exec) => guardExec(exec));
+    }
+  } catch { /* cordis: undeclared service access may throw */ }
+  ctx.on('tools/guard', (exec) => guardExec(exec));
+
   ctx.on('session/event', (session, event) => {
     try {
       if (event?.type !== 'user/message' && event?.type !== 'turn/end') return;
@@ -968,7 +1081,7 @@ export function apply(ctx, config) {
       st.callsSinceReminder += 1;
       st.byTool[tool] = (st.byTool[tool] ?? 0) + 1;
 
-      if (PRODUCTIVE_TOOLS.has(tool)) {
+      if (isProductiveTool(tool)) {
         st.edits += 1;
         st.editsSinceReminder += 1;
         if (cfg.editFoldback) {
@@ -986,7 +1099,7 @@ export function apply(ctx, config) {
             }
           } catch { /* fold-back detection is best-effort */ }
         }
-      } else if (tool === 'Bash') {
+      } else if (isShellTool(tool)) {
         const cmd = extractCmd(exec);
         const n = normCmd(cmd);
         const r = rawCmd(cmd);
@@ -1015,8 +1128,8 @@ export function apply(ctx, config) {
           ].join('\n'), kindCooldown(cfg, 'fail-loop', cfg.failCooldownSec * 1000),
           st.failStreak, 'lastFailReminderAt', 'lastFailReminderAt');
           if (text) {
-            if (st.reminders >= 3) {
-              text += '\n⚠️ 这已是本会话第 ' + (st.reminders + 1) + ' 次提醒。请考虑完全放弃当前路径,直接向用户汇报。';
+            if (st.reminders >= cfg.escalateAfterReminders) {
+              text += '\n⚠️ 这已是本会话第 ' + st.reminders + ' 次提醒。请考虑完全放弃当前路径,直接向用户汇报。';
             }
             const rl = reportLine(cfg);
             if (rl) text += '\n' + rl;
@@ -1027,7 +1140,8 @@ export function apply(ctx, config) {
               const lastFail = [...st.recentLog].reverse().find((e) => !e.ok);
               if (lastFail) {
                 registerLesson(normCmd(lastFail.brief) || '未知模式',
-                  '连续失败 ' + streak + ' 次后被打断——换方法前请先读错误定位根因,勿重复此方式');
+                  '连续失败 ' + streak + ' 次后被打断——换方法前请先读错误定位根因,勿重复此方式',
+                  lastFail.brief);
               }
             }
             st.failStreak = 0;
@@ -1138,4 +1252,5 @@ export const __test = {
   // adaptive_* 键的唯一执行位、adaptiveStats 是模块级统计（跨会话存活，
   // 故探针必须能读取/清空，否则用例互相污染）。
   freshState, kindCooldown, adaptiveStats,
+  checkLessonGuard, registerLesson, lessonsLedger,
 };

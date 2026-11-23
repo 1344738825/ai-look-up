@@ -32,31 +32,62 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 CORE = os.path.abspath(os.path.join(HERE, "..", "..", "hooks", "lookup_hook.py"))
 
 
-def main():
-    action = sys.argv[1] if len(sys.argv) > 1 else "post-use"
+EVENT_TO_ACTION = {
+    "UserPromptSubmit": "prompt",
+    "PreToolUse": "pre-use",
+    "PostToolUse": "post-use",
+    "PostToolUseFailure": "post-fail",
+    "Stop": "stop",
+}
+
+VALID_ACTIONS = ("prompt", "pre-use", "post-use", "post-fail", "stop")
+
+
+def read_stdin():
     try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
-        if not isinstance(data, dict):
-            data = {}
+        if sys.stdin is None or sys.stdin.isatty():
+            return {}
     except Exception:
-        return 0
+        return {}
+    try:
+        raw = sys.stdin.buffer.read()
+        text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else raw
+        data = json.loads(text) if text and text.strip() else {}
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
-    payload = {
-        "session_id": data.get("session_id") or data.get("sessionId") or "",
-        "tool_name": data.get("tool_name") or data.get("toolName") or "Unknown",
-        "tool_input": data.get("tool_input") or data.get("toolInput") or {},
-    }
 
+def resolve_action(argv, data):
+    if len(argv) > 1 and argv[1] in VALID_ACTIONS:
+        action = argv[1]
+    else:
+        ev = data.get("hook_event_name") or data.get("hookEventName") or ""
+        action = EVENT_TO_ACTION.get(ev, "post-use" if not ev else "")
     if action == "post-use":
         resp = data.get("tool_response")
-        err = isinstance(resp, dict) and bool(resp.get("is_error") or resp.get("isError"))
+        err = (isinstance(resp, dict) and bool(resp.get("is_error") or resp.get("isError"))) or bool(data.get("error"))
         if err:
             action = "post-fail"
-    if action == "prompt":
-        action = "prompt"
-    if action not in ("prompt", "post-use", "post-fail", "stop"):
+    return action
+
+
+def main():
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    data = read_stdin()
+    action = resolve_action(sys.argv, data)
+    if action not in VALID_ACTIONS:
         return 0
+
+    payload = dict(data)
+    payload["session_id"] = data.get("session_id") or data.get("sessionId") or ""
+    payload["tool_name"] = data.get("tool_name") or data.get("toolName") or "Unknown"
+    payload["tool_input"] = data.get("tool_input") or data.get("toolInput") or {}
 
     try:
         proc = subprocess.run(
@@ -67,6 +98,7 @@ def main():
         out = proc.stdout
         if out:
             sys.stdout.buffer.write(out)
+            sys.stdout.buffer.flush()
     except Exception:
         pass
     return 0

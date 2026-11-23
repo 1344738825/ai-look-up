@@ -30,6 +30,7 @@
     "drift_check_calls": 30,
     "drift_cooldown_sec": 900,
     "lessons_ttl_days": 7,
+    "lesson_guard_hits": 2,
     "round_replan_rounds": 8,
     "round_replan_min_calls": 10,
     "step_replan_calls": 80,

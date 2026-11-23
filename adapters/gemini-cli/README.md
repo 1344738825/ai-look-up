@@ -4,14 +4,17 @@ Gemini CLI 于 2026 年初上线了 hooks 机制(HookRunner 以子进程方式�
 事件点覆盖 agent loop 的关键生命周期)。**本目录目前只提供映射表与骨架,未在真机验证**——
 字段名以所用版本的官方 hooks 文档为准,欢迎 PR 补充验证结果。
 
-## 事件映射草案(待按官方文档核对)
+## 事件映射(lookup_gemini_adapter.py)
+
+`lookup_gemini_adapter.py` 同时支持 Gemini CLI hooks v1 事件名与 Claude Code 兼容事件名，并支持无参 auto 模式（按 stdin 的 `hook_event_name` 自动路由）：
 
 | Gemini CLI hook | 核心协议动作 | 说明 |
 |---|---|---|
-| 会话/用户输入开始类事件 | `prompt` | 重置回合计数 |
-| 工具调用完成类事件(成功) | `post-use` | payload 需映射 tool 名与命令 |
-| 工具调用完成类事件(失败) | `post-fail` | 若无独立失败事件,按响应中的错误标志推导 |
-| 会话结束类事件 | `stop` | 结束复盘 |
+| `BeforeAgent` / `UserPromptSubmit` | `prompt` | 重置回合计数，注入已知坑位与回合里程碑 |
+| `BeforeTool` / `PreToolUse` | `pre-use` | 命令执行前对照教训账本，拦截重复踩坑 |
+| `AfterTool` / `PostToolUse` (成功) | `post-use` | 记录工具调用并检测空跑 |
+| `AfterTool` (含 error) / `PostToolUseFailure` | `post-fail` | 累计连续失败并登记坑位 |
+| `AfterAgent` / `SessionEnd` / `Stop` | `stop` | 结束前零产出审查 |
 
 ## 接入步骤(校准后)
 

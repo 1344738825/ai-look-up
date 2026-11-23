@@ -12,6 +12,18 @@
         ]
       }
     ],
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"${CLAUDE_PLUGIN_ROOT}/hooks/lookup_hook.py\" pre-use",
+            "timeout": 15,
+            "statusMessage": "AI 抬头:检查已知失败坑位"
+          }
+        ]
+      }
+    ],
     "PostToolUse": [
       {
         "hooks": [

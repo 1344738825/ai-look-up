@@ -47,6 +47,8 @@ argument-hint: "[要调整的参数=新值, 或留空查看]"
 | `show_to_user` | `true` | 用户可见呈报:提醒要求 AI 在可见回复开头一行简报,信封附 systemMessage |
 | `lessons` | `true` | 教训登记簿:失败登记坑位,回合开始注入 Top 3 |
 | `lessons_ttl_days` | `7` | 坑位超过 N 天未被再次踩到即自动淘汰;`0` = 永不淘汰 |
+| `lesson_guard` | `true` | 命令执行前(PreToolUse)对照教训账本拦截重复踩坑 |
+| `lesson_guard_hits` | `2` | 同一归一化模式累计失败循环达 N 次(或原样重跑失败命令)时硬拦截 |
 | `llm_review` | `false` | 触发提醒时用独立 LLM 上下文审查是否空跑 |
 | `llm_api_base` | `https://api.deepseek.com` | OpenAI 兼容接口地址 |
 | `llm_api_key` | 空 | 接口密钥,填写后审查才生效 |
