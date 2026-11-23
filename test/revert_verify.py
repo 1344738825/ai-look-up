@@ -365,17 +365,51 @@ verify(
 verify(
     "Python: handle_post_fail 漏取回第三通道结论（连续失败时死锁滞留）",
     HOOK,
-    'def handle_post_fail(cfg, data, state, now):\n'
-    '    state["last_event_at"] = now\n'
-    '    state["fail_streak"] += 1\n'
-    '    state["total_failures"] += 1\n'
+    '    state["last_was_cmd_fail"] = bool(cur_norm)\n'
     '    pending_verdicts = take_review_results(state, cfg, now) if cfg.get("deliver_review") else []',
-    'def handle_post_fail(cfg, data, state, now):\n'
-    '    state["last_event_at"] = now\n'
-    '    state["fail_streak"] += 1\n'
-    '    state["total_failures"] += 1\n'
+    '    state["last_was_cmd_fail"] = bool(cur_norm)\n'
     '    pending_verdicts = []',
     [PY, os.path.join(HERE, "channel_check.py")],
+)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# v0.10 四项优化：每条都回退成缺陷形态，确认 golden_check 真的变红。
+# ═══════════════════════════════════════════════════════════════════════════
+verify(
+    "v0.10/任务一: 命令成功后不消坑（坑位只进不出）",
+    HOOK,
+    '        if cfg.get("lessons"):\n'
+    '            redeem_lesson(cmd, cfg)',
+    '        if False:\n'
+    '            redeem_lesson(cmd, cfg)',
+    [PY, os.path.join(HERE, "golden_check.py")],
+)
+
+verify(
+    "v0.10/任务一: 编辑后仍硬拦截（修复后验证被误拦）",
+    HOOK,
+    '    if current_edits > edits_at:\n'
+    '        return "warn"',
+    '    if False:\n'
+    '        return "warn"',
+    [PY, os.path.join(HERE, "golden_check.py")],
+)
+
+verify(
+    "v0.10/任务二: 夹心失败判定被拆（穿插只读的连败不再触发）",
+    HOOK,
+    '    interleaved_hit = (state.get("cmd_fail_interleaves", 0) >= 2\n'
+    '                       and state.get("cmd_fail_streak", 0) >= cfg["fail_streak_threshold"])',
+    '    interleaved_hit = False',
+    [PY, os.path.join(HERE, "golden_check.py")],
+)
+
+verify(
+    "v0.10/任务四: 非 Bash 只读工具不进重复窗口（Grep 原地打转漏报）",
+    HOOK,
+    '        n, r = non_shell_repeat_sig(tool, data)',
+    '        n, r = "", ""',
+    [PY, os.path.join(HERE, "golden_check.py")],
 )
 
 # ═══════════════════════════════════════════════════════════════════════════

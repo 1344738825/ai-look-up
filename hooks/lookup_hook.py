@@ -207,6 +207,43 @@ def clip_goal(goal, head=120, tail=80):
         return goal
     return goal[:head] + " … " + goal[-tail:]
 
+
+# 短确认词:这类回复只是"继续推进"的许可,不构成新任务,不能冲掉初始目标。
+_SHORT_ACKS = {
+    "继续", "好的", "好", "可以", "行", "都做吧", "没问题", "是的", "对",
+    "ok", "okay", "yes", "y", "go", "go ahead", "continue", "proceed",
+    "sure", "do it",
+}
+_PUNCT_RX = re.compile(r"[\s\u3000,，。.!！?？~～、:：;；'\"“”‘’()（）\[\]【】]+")
+
+
+def is_substantive_goal(text):
+    """判断一条用户输入是否构成"实质任务指令"。
+
+    空串、以及长度 < 10 且（去标点后）命中短确认词集合的回复都不算实质指令。
+    """
+    s = (text or "").strip()
+    if not s:
+        return False
+    if len(s) < 10 and _PUNCT_RX.sub("", s).lower() in _SHORT_ACKS:
+        return False
+    return True
+
+
+def update_goals(state, text):
+    """双层目标维护:initial_goal 保最初实质任务,last_goal 只被实质指令覆盖。"""
+    g = (text or "").strip()
+    if not g:
+        return
+    cur_initial = state.get("initial_goal") or ""
+    if not cur_initial:
+        state["initial_goal"] = g[:400]
+    elif not is_substantive_goal(cur_initial) and is_substantive_goal(g):
+        # 首轮只是"继续/好的"这类寒暄时,第一条实质指令升级为初始目标
+        state["initial_goal"] = g[:400]
+    if is_substantive_goal(g) or not (state.get("last_goal") or ""):
+        state["last_goal"] = g[:400]
+
 DRIFT_LABEL = {"on-track": "仍在服务主线", "drifting": "子任务喧宾夺主", "stuck": "已明显偏离主线"}
 
 REVIEW_DRIFT_SYSTEM = (
@@ -436,9 +473,13 @@ def _lessons_alive(lessons, ttl_days):
             if isinstance(e, dict) and e.get("last_seen", 0) >= deadline]
 
 
-def register_lesson(pattern, correction, cfg=None, raw=""):
+def register_lesson(pattern, correction, cfg=None, raw="", edits_at=None):
     """登记/累加一条坑位教训;同模式合并,hits 记录被踩次数。
-    写入时顺带按 TTL 淘汰过期坑位,账本不会只增不减。"""
+    写入时顺带按 TTL 淘汰过期坑位,账本不会只增不减。
+
+    edits_at:登记当时的编辑计数。命中拦截时若当前 edits 已超过它,
+    说明期间改过代码——这是"修复后验证",应降级为软预警而非硬拦截。
+    """
     if not pattern:
         return
     try:
@@ -456,12 +497,16 @@ def register_lesson(pattern, correction, cfg=None, raw=""):
             entry["last_seen"] = time.time()
             if clean_raw:
                 entry["last_raw"] = clean_raw
+            if edits_at is not None:
+                entry["edits_at"] = int(edits_at)
             break
     else:
         item = {"pattern": pattern, "correction": correction,
                 "hits": 1, "last_seen": time.time()}
         if clean_raw:
             item["last_raw"] = clean_raw
+        if edits_at is not None:
+            item["edits_at"] = int(edits_at)
         lessons.append(item)
     lessons.sort(key=lambda e: -e.get("hits", 1))
     try:
@@ -471,9 +516,59 @@ def register_lesson(pattern, correction, cfg=None, raw=""):
         pass
 
 
-def check_lesson_guard(cmd, cfg=None):
+def redeem_lesson(cmd, cfg=None):
+    """命令执行成功 → 对应坑位扣减一次;扣到 0 即移除,账本不再只进不出。
+
+    仅在该 pattern 确实命中账本时才写回,普通成功命令不产生额外磁盘写。
+    """
+    n = norm_cmd(cmd)
+    if not n or not (cfg or {}).get("lessons", True):
+        return
+    try:
+        with open(lessons_path(), encoding="utf-8") as f:
+            lessons = json.load(f)
+        lessons = lessons if isinstance(lessons, list) else []
+    except Exception:
+        return
+    changed = False
+    kept = []
+    for entry in lessons:
+        if isinstance(entry, dict) and entry.get("pattern") == n:
+            changed = True
+            entry.pop("last_raw", None)
+            entry["hits"] = entry.get("hits", 1) - 1
+            if entry["hits"] <= 0:
+                continue
+        kept.append(entry)
+    if not changed:
+        return
+    try:
+        with open(lessons_path(), "w", encoding="utf-8") as f:
+            json.dump(kept, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _guard_action(action, entry, current_edits):
+    """硬拦截降级:命中坑位后若已发生新的编辑,判定为"修复后验证",只软预警。
+
+    current_edits 为 None(调用方未提供)或账本未记录 edits_at 时行为不变,
+    保证既有单测探针语义不被改写。
+    """
+    if action != "block" or current_edits is None:
+        return action
+    edits_at = entry.get("edits_at") if isinstance(entry, dict) else None
+    if edits_at is None:
+        return action
+    if current_edits > edits_at:
+        return "warn"
+    return action
+
+
+def check_lesson_guard(cmd, cfg=None, current_edits=None):
     """命令执行前对照教训登记簿:
       - 原样命令(last_raw)再次执行,或同一模式累计失败循环 >= lesson_guard_hits 次 → ("block", entry)
+      - 期间已编辑过文件(编辑解锁) → 降级 ("warn", entry)
       - 仅归一化模式命中但已改过参数/脚本序号且未达硬拦截阈值 → ("warn", entry)
       - 未命中或开关关闭 → (None, None)
     """
@@ -495,10 +590,10 @@ def check_lesson_guard(cmd, cfg=None):
     for entry in alive:
         last_raw = entry.get("last_raw") or ""
         if r and last_raw and r == last_raw:
-            return "block", entry
+            return _guard_action("block", entry, current_edits), entry
         if n and entry.get("pattern") == n:
             if entry.get("hits", 1) >= guard_hits:
-                return "block", entry
+                return _guard_action("block", entry, current_edits), entry
             return "warn", entry
     return None, None
 
@@ -651,6 +746,12 @@ def new_state(sid, now):
         "calls_since_reminder": 0,
         "calls_at_stretch_start": 0,
         "fail_streak": 0,
+        # 夹心式失败：同一归一化命令在"无文件修改、无该命令成功"期间的连败，
+        # 以及两次失败之间穿插的只读成功段数。用于识别 Fail→Read→Fail→Read→Fail。
+        "cmd_fail_norm": "",
+        "cmd_fail_streak": 0,
+        "cmd_fail_interleaves": 0,
+        "last_was_cmd_fail": False,
         "total_failures": 0,
         "recent_cmds": [],
         "reminders": 0,
@@ -663,6 +764,9 @@ def new_state(sid, now):
         "clock_ticks": 0,
         "clock_interval": 0,
         "recent_log": [],
+        # 双层目标：initial_goal 是会话最初的实质任务（不被"继续/好的"冲掉），
+        # last_goal 是当前指令。审查材料优先用前者，后者仅在实质指令时覆盖。
+        "initial_goal": "",
         "last_goal": "",
         "reviews": 0,
         "lessons_sig": "",
@@ -931,6 +1035,10 @@ def reset_stretch(state, cfg, now):
     state["calls_since_reminder"] = 0
     state["edits_since_reminder"] = 0
     state["fail_streak"] = 0
+    state["cmd_fail_norm"] = ""
+    state["cmd_fail_streak"] = 0
+    state["cmd_fail_interleaves"] = 0
+    state["last_was_cmd_fail"] = False
     state["recent_cmds"] = []
     state["clock_interval"] = 0
     state["reminders"] = 0
@@ -952,6 +1060,48 @@ def extract_cmd(data):
             if isinstance(v, str):
                 return v
     return ""
+
+
+_SEARCH_ONLY_TOOLS = {"grep", "glob", "webfetch", "websearch", "search",
+                      "grep_search", "find_by_name", "find_files"}
+_READ_TOOLS = {"read", "read_file", "view_file"}
+_RANGE_KEYS = ("offset", "limit", "start_line", "end_line", "StartLine", "EndLine")
+
+
+def non_shell_repeat_sig(tool, data):
+    """非 Shell 只读工具的重复签名:(norm, raw);无法判定重复时返回 ("", "")。
+
+    只对两类调用生效:
+      A) 搜索/网络/查询类(Grep/Glob/WebFetch/...) —— 按查询主体判重;
+      B) 带显式行号范围的 Read —— 按 文件+区间 判重。
+    裸 Read(仅 file_path)刻意不参与:它是各宿主里最常见的"推进步数"垫脚调用,
+    纳入判重会让所有正常浏览都误报空转。
+    """
+    ti = data.get("tool_input") or data.get("toolInput") or {}
+    if not isinstance(ti, dict):
+        return "", ""
+    t_low = str(tool or "").lower()
+    if t_low in _SEARCH_ONLY_TOOLS:
+        q = ti.get("pattern") or ti.get("query") or ti.get("url") or ti.get("path") or ""
+        if not q:
+            return "", ""
+        norm = "%s:%s" % (t_low, raw_cmd(str(q)).lower()[:80])
+        try:
+            dumped = json.dumps(ti, sort_keys=True, ensure_ascii=False)
+        except Exception:
+            dumped = str(q)
+        raw = "%s:%s" % (t_low, raw_cmd(dumped))
+        return norm, raw
+    if t_low in _READ_TOOLS:
+        if not any(ti.get(k) is not None and ti.get(k) != "" for k in _RANGE_KEYS):
+            return "", ""
+        p = _extract_path(ti).replace("\\", "/").lower()
+        if not p:
+            return "", ""
+        rng = ",".join("%s=%s" % (k, ti[k]) for k in _RANGE_KEYS if ti.get(k) is not None)
+        sig = "read:%s#%s" % (p, rng)
+        return sig, sig
+    return "", ""
 
 
 _SCRIPT_EXTS = _SPEC.get("script_extensions", ["py", "js", "ts", "mjs", "cjs", "sh", "ps1", "bat"])
@@ -1187,6 +1337,41 @@ def brief_of(data, tool):
     return ""
 
 
+def _first_line_80(text):
+    s = str(text or "").strip()
+    if not s:
+        return ""
+    line = s.splitlines()[0].strip()
+    return line[:80].replace("\n", " ")
+
+
+def extract_err(data):
+    """从失败事件里提取一行错误摘要(前 80 字),供审查材料直接引用根因。
+
+    顺序:data.error → tool_response(字典取 error/stderr/output/message,
+    字符串直接取)。取不到返回 ""。
+    """
+    if not isinstance(data, dict):
+        return ""
+    err = data.get("error")
+    if err:
+        if isinstance(err, dict):
+            err = err.get("message") or err.get("error") or ""
+        if err:
+            return _first_line_80(err)
+    resp = data.get("tool_response")
+    if resp is None:
+        resp = data.get("toolResponse")
+    if isinstance(resp, dict):
+        for k in ("error", "stderr", "output", "message"):
+            v = resp.get(k)
+            if v:
+                return _first_line_80(v)
+    elif isinstance(resp, str):
+        return _first_line_80(resp)
+    return ""
+
+
 def build_review_material(state, cfg, now, kind, detail):
     log = state.get("recent_log", [])
     # 先按"连续同工具段"折叠、再取最近 N 段:关键旧证据不因新同形刷屏被挤出窗口
@@ -1205,16 +1390,29 @@ def build_review_material(state, cfg, now, kind, detail):
         tail = (run[-1].get("brief") or "")[:40]
         if len(run) > 1:
             mark = "✗{}/{}, ".format(fails, len(run)) if fails else ""
-            log_lines.append("{t}×{n}({mark}{a} … {b})".format(
-                t=t, n=len(run), mark=mark, a=head, b=tail))
+            line = "{t}×{n}({mark}{a} … {b})".format(
+                t=t, n=len(run), mark=mark, a=head, b=tail)
         else:
-            log_lines.append("[{t}{ok}] {b}".format(
-                t=t, ok=" ✗" if fails else "", b=(run[0].get("brief") or "无")[:60]))
+            line = "[{t}{ok}] {b}".format(
+                t=t, ok=" ✗" if fails else "", b=(run[0].get("brief") or "无")[:60])
+        if fails:
+            # 失败段直接带上最后一条错误摘要:审查者不必只凭"某命令失败了"猜根因
+            last_err = next((e.get("err") for e in reversed(run) if e.get("err")), "")
+            if last_err:
+                line += " [错误: " + str(last_err) + "]"
+        log_lines.append(line)
     dist = ", ".join("{k}×{v}".format(k=k, v=v) for k, v in
                      sorted(state.get("by_tool", {}).items(), key=lambda kv: -kv[1])[:4])
+    _ig = state.get("initial_goal") or ""
+    _lg = state.get("last_goal") or ""
+    if _ig and _lg and _ig != _lg:
+        task_line = ("【任务】" + clip_goal(_ig)
+                     + " (当前指令: " + clip_goal(_lg, 60, 40) + ")")
+    else:
+        task_line = "【任务】" + clip_goal(_lg or _ig)
     parts = [
         "【审查材料】触发: " + kind,
-        "【任务】" + clip_goal(state.get("last_goal")),
+        task_line,
         "【统计】{m:.0f} 分钟/{c} 次调用/修改 {e},连败 {f},累计败 {t}。".format(
             m=fmt_minutes(state, now), c=state.get("tool_calls", 0),
             e=state.get("edits", 0), f=state.get("fail_streak", 0),
@@ -1366,7 +1564,8 @@ def handle_pre_use(cfg, data, state, now):
     if not is_shell_tool(tool):
         return None
     cmd = extract_cmd(data)
-    action_kind, entry = check_lesson_guard(cmd, cfg)
+    # current_edits:命中坑位后若期间发生过编辑,判定为"修复后验证"→ 降级软预警
+    action_kind, entry = check_lesson_guard(cmd, cfg, current_edits=state.get("edits", 0))
     if not action_kind or not entry:
         return None
     pat = entry.get("pattern", "")
@@ -1422,6 +1621,11 @@ def handle_post_use(cfg, data, state, now):
     if is_productive_tool(tool):
         state["edits"] += 1
         state["edits_since_reminder"] += 1
+        # 有代码修改 → 不是原地盲试,夹心连败计数整体失效
+        state["cmd_fail_norm"] = ""
+        state["cmd_fail_streak"] = 0
+        state["cmd_fail_interleaves"] = 0
+        state["last_was_cmd_fail"] = False
         if cfg["edit_foldback"] and record_edit_hash(state, cfg, data):
             state["foldback_hit"] = True
             ti = data.get("tool_input") or data.get("toolInput") or {}
@@ -1430,6 +1634,24 @@ def handle_post_use(cfg, data, state, now):
         cmd = extract_cmd(data)
         n = norm_cmd(cmd)
         r = raw_cmd(cmd)
+        if n or r:
+            recent = state.get("recent_cmds", [])
+            recent.append({"t": now, "n": n, "r": r})
+            state["recent_cmds"] = recent[-cfg["max_recent_cmds"]:]
+        # 命令跑通了 → 夹心连败终结,同时从账本里消掉一次对应坑位
+        state["cmd_fail_norm"] = ""
+        state["cmd_fail_streak"] = 0
+        state["cmd_fail_interleaves"] = 0
+        state["last_was_cmd_fail"] = False
+        if cfg.get("lessons"):
+            redeem_lesson(cmd, cfg)
+    else:
+        # 只读工具成功:fail_streak 照旧清零(原有语义),但若刚发生同命令失败,
+        # 记一次"穿插只读段"——夹心死循环的识别依据。
+        if state.get("cmd_fail_streak", 0) > 0 and state.get("last_was_cmd_fail"):
+            state["cmd_fail_interleaves"] = state.get("cmd_fail_interleaves", 0) + 1
+            state["last_was_cmd_fail"] = False
+        n, r = non_shell_repeat_sig(tool, data)
         if n or r:
             recent = state.get("recent_cmds", [])
             recent.append({"t": now, "n": n, "r": r})
@@ -1598,6 +1820,18 @@ def handle_post_fail(cfg, data, state, now):
     state["last_event_at"] = now
     state["fail_streak"] += 1
     state["total_failures"] += 1
+    tool_name = str(data.get("tool_name") or data.get("toolName") or "Unknown")
+    # 夹心式失败状态机:同一归一化命令在"无文件修改、无该命令成功"期间累计失败,
+    # 并记录两次失败之间穿插的只读成功段数。Fail→Read→Fail→Read→Fail 时,
+    # fail_streak 每轮被 Read 清零,只有这组计数能识别"原地盲试"。
+    cur_norm = norm_cmd(extract_cmd(data)) if is_shell_tool(tool_name) else ""
+    if cur_norm and cur_norm == state.get("cmd_fail_norm"):
+        state["cmd_fail_streak"] = state.get("cmd_fail_streak", 0) + 1
+    else:
+        state["cmd_fail_norm"] = cur_norm
+        state["cmd_fail_streak"] = 1 if cur_norm else 0
+        state["cmd_fail_interleaves"] = 0
+    state["last_was_cmd_fail"] = bool(cur_norm)
     pending_verdicts = take_review_results(state, cfg, now) if cfg.get("deliver_review") else []
     carried = "\n".join(pending_verdicts) if pending_verdicts else ""
 
@@ -1607,11 +1841,18 @@ def handle_post_fail(cfg, data, state, now):
         return post_fail_output(t, cfg)
 
     log = state.get("recent_log", [])
-    log.append({"tool": str(data.get("tool_name") or data.get("toolName") or "Unknown"),
-                "brief": brief_of(data, str(data.get("tool_name") or data.get("toolName") or "Unknown")), "ok": False})
+    entry = {"tool": tool_name, "brief": brief_of(data, tool_name), "ok": False}
+    err = extract_err(data)
+    if err:
+        entry["err"] = err
+    log.append(entry)
     state["recent_log"] = log[-max(cfg["review_log_floor"], cfg["review_log_size"]):]
-    if state["fail_streak"] < cfg["fail_streak_threshold"]:
+    interleaved_hit = (state.get("cmd_fail_interleaves", 0) >= 2
+                       and state.get("cmd_fail_streak", 0) >= cfg["fail_streak_threshold"])
+    if state["fail_streak"] < cfg["fail_streak_threshold"] and not interleaved_hit:
         return post_fail_output(carried, cfg) if carried else None
+    # 夹心触发时 fail_streak 可能被只读成功清零过,对外报数取两者较大值
+    streak = max(state["fail_streak"], state.get("cmd_fail_streak", 0))
     # ★ v0.8:fail-loop 收编进 fire()。此前这里是手工复刻的整套状态维护,
     #   漏抄了 3 项(F1)。现在前置门槛(连败阈值)留在这里,其余全部交给 fire()。
     #   冷却基准用 last_fail_reminder_at(独立于其它触发器),故 cooldown_key
@@ -1620,12 +1861,13 @@ def handle_post_fail(cfg, data, state, now):
         state, cfg, now, "fail-loop",
         "\n".join([
             "🔔 【AI 抬头 · 失败循环】你已连续失败 {n} 次。请勿再用同样的方式重试:".format(
-                n=state["fail_streak"]),
+                n=streak),
             "1. 完整读取最近一次的错误信息,定位根因(而不是只看表面症状);",
             "2. 判断:这是可以修复的问题,还是方法本身不可行?",
             "3. 换方法、修复后再试;若连续两次换方法仍失败,停下来向用户汇报卡点。",
         ]),
         kind_cooldown(cfg, "fail-loop", cfg["fail_cooldown_sec"]),
+        fail_at=streak,
         stamp_key="last_fail_reminder_at",
         cooldown_key="last_fail_reminder_at",
     )
@@ -1637,8 +1879,12 @@ def handle_post_fail(cfg, data, state, now):
     rl = report_line(cfg)
     if rl:
         text += "\n" + rl
-    streak = state["fail_streak"]
     state["fail_streak"] = 0
+    # 触发即闭环:夹心计数一并归零,下一轮从干净状态重新累计
+    state["cmd_fail_norm"] = ""
+    state["cmd_fail_streak"] = 0
+    state["cmd_fail_interleaves"] = 0
+    state["last_was_cmd_fail"] = False
     if cfg.get("lessons"):
         last_fail = next((e for e in reversed(state.get("recent_log", [])) if not e.get("ok")), None)
         if last_fail:
@@ -1646,7 +1892,8 @@ def handle_post_fail(cfg, data, state, now):
                 norm_cmd(last_fail.get("brief", "")) or "未知模式",
                 "连续失败 {n} 次后被打断——换方法前请先读错误定位根因,勿重复此方式".format(n=streak),
                 cfg,
-                raw=last_fail.get("brief", ""))
+                raw=last_fail.get("brief", ""),
+                edits_at=state.get("edits", 0))
     return emit_fail(finalize_text(
         state, cfg, now, "fail-loop",
         "连续失败 {n} 次".format(n=streak),
@@ -1657,10 +1904,10 @@ def handle_prompt(cfg, data, state, now):
     state["last_event_at"] = now
     state["prompt_resets"] += 1
     reset_stretch(state, cfg, now)
-    # 捕获任务描述,供独立审查者使用(尽力而为)
+    # 捕获任务描述,供独立审查者使用(尽力而为)。双层目标:短确认回复不冲掉初始任务。
     goal = data.get("prompt") or data.get("user_prompt") or ""
     if isinstance(goal, str) and goal.strip():
-        state["last_goal"] = goal.strip()[:400]
+        update_goals(state, goal)
     parts = []
     # 回合里程碑:连续 N 个回合未做全局重规划 → 新回合开始时强制抬头。
     # 步数下限挡住纯寒暄轮;计数跨回合累计,只有真正触发才复位(见 replan_reset)。

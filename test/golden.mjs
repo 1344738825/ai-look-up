@@ -522,6 +522,99 @@ check('behavior lessonGuardHits（阈值 2：hits=2 硬拦截 / hits=1 仅软预
   __test.lessonsLedger.clear();
 });
 
+// ── v0.10 四项优化的 JS 侧断言 ─────────────────────────────────────────
+check('task1 编辑解锁与成功消坑：未编辑→block，编辑后→warn，成功后递减至移除', () => {
+  const cfg = { ...__test.defaults, lessons: true, lessonGuard: true };
+  __test.lessonsLedger.clear();
+  __test.registerLesson('python fix_probe.js', 'c', 'python fix_probe.js', 2);
+  assert.equal(__test.checkLessonGuard('python fix_probe.js', cfg, 2)?.action, 'block',
+    '编辑计数未变 → 仍硬拦截');
+  assert.equal(__test.checkLessonGuard('python fix_probe.js', cfg, 3)?.action, 'warn',
+    '编辑计数已增加 → 降级软预警');
+  __test.lessonsLedger.clear();
+  __test.registerLesson('python fix_probe.js', 'c', 'python fix_probe.js', 0);
+  __test.registerLesson('python fix_probe.js', 'c', 'python fix_probe.js', 0);
+  assert.equal(__test.lessonsLedger.get('python fix_probe.js').hits, 2);
+  __test.redeemLesson('python fix_probe.js', cfg);
+  const afterOne = __test.lessonsLedger.get('python fix_probe.js');
+  assert.equal(afterOne.hits, 1, '成功一次 hits 2→1');
+  assert.equal(afterOne.lastRaw, '', '成功即清掉原样命令,不再按原样拦截');
+  __test.redeemLesson('python fix_probe.js', cfg);
+  assert.equal(__test.lessonsLedger.has('python fix_probe.js'), false, '扣到 0 应移出账本');
+  __test.lessonsLedger.clear();
+});
+
+check('task2 夹心失败：穿插只读 2 段后第 3 次失败触发；单段穿插不触发', () => {
+  const base = { clockTick: false, lessons: false, llmReview: false, adaptive: false,
+    cooldownSec: 0, failCooldownSec: 0, failStreakThreshold: 3, maxReminders: 99,
+    repeatMinCalls: 999, callNudgeInterval: 999, longRunMinCalls: 999,
+    stepReplanCalls: 9999, roundReplanRounds: 9999 };
+  const sandwich = mkAgent(base);
+  sandwich.call('Bash', { command: 'python x.py' }, true);
+  sandwich.call('Read', { file_path: 'a.txt' });
+  sandwich.call('Bash', { command: 'python x.py' }, true);
+  sandwich.call('Read', { file_path: 'a.txt' });
+  sandwich.call('Bash', { command: 'python x.py' }, true);
+  const control = mkAgent(base);
+  control.call('Bash', { command: 'python x.py' }, true);
+  control.call('Bash', { command: 'python x.py' }, true);
+  control.call('Read', { file_path: 'a.txt' });
+  control.call('Bash', { command: 'python x.py' }, true);
+  control.call('Bash', { command: 'python x.py' }, true);
+  assert.equal(markerCount(sandwich.agent, '失败循环'), 1, '夹心循环第 3 次失败应触发');
+  assert.equal(markerCount(control.agent, '失败循环'), 0,
+    '只穿插 1 段不得触发(dsh-smoke #2 红线)');
+});
+
+check('task3 双层目标：短确认不冲掉初始任务，换任务并列，单轮格式不变', () => {
+  const a = mkAgent({ clockTick: false, lessons: false, llmReview: false, adaptive: false });
+  const longGoal = '重构订单幂等模块并补齐单元测试';
+  const say = (text) => a.emit('session/event', a.agent.session,
+    { type: 'user/message', data: { text } });
+  say(longGoal);
+  say('继续');
+  assert.equal(a.st().initialGoal, longGoal);
+  assert.equal(a.st().goal, longGoal, '"继续"不得冲掉当前指令');
+  const m = __test.buildReviewMaterial(a.st(), { ...__test.defaults }, Date.now(), 'no-output', '');
+  assert.ok(m.includes(longGoal), '材料必须保留初始长指令');
+  say('另外补一版性能压测报告');
+  const m2 = __test.buildReviewMaterial(a.st(), { ...__test.defaults }, Date.now(), 'no-output', '');
+  assert.ok(m2.includes('(当前指令: 另外补一版性能压测报告)'), '换任务时应并列展示当前指令');
+  const single = mkAgent({ clockTick: false, lessons: false });
+  single.emit('session/event', single.agent.session,
+    { type: 'user/message', data: { text: longGoal } });
+  const m3 = __test.buildReviewMaterial(single.st(), { ...__test.defaults }, Date.now(), 'no-output', '');
+  assert.ok(!m3.includes('当前指令'), '单轮任务不得出现当前指令标注');
+});
+
+check('task3 错误摘要：材料含 error 首行、不含堆栈后续行', () => {
+  const a = mkAgent({ clockTick: false, lessons: false, llmReview: false, adaptive: false,
+    failStreakThreshold: 1, cooldownSec: 0, failCooldownSec: 0 });
+  a.emit('tools/result', exec(a.agent, 'Bash', { command: 'python app.js' }),
+    { isError: true, error: 'ModuleNotFoundError: No module named foo\nTraceback (most recent call last):' });
+  assert.equal(a.st().recentLog.at(-1).err, 'ModuleNotFoundError: No module named foo',
+    '日志条目应带首行错误摘要');
+  const m = __test.buildReviewMaterial(a.st(), { ...__test.defaults }, Date.now(), 'fail-loop', '');
+  assert.ok(m.includes('[错误: ModuleNotFoundError: No module named foo]'));
+  assert.ok(!m.includes('Traceback'), '只取首行,不把堆栈灌进材料');
+});
+
+check('task4 只读重复：同 Grep / 同区间 Read 触发，裸 Read 静默', () => {
+  const base = { clockTick: false, lessons: false, llmReview: false, adaptive: false,
+    cooldownSec: 0, failCooldownSec: 0, repeatMinCalls: 0, repeatCmdCount: 3, repeatWindow: 5,
+    callNudgeInterval: 999, longRunMinCalls: 999, stepReplanCalls: 9999,
+    roundReplanRounds: 9999 };
+  const g = mkAgent(base);
+  for (let i = 0; i < 3; i++) g.call('Grep', { pattern: 'TODO' });
+  const r = mkAgent(base);
+  for (let i = 0; i < 3; i++) r.call('Read', { file_path: 'a.txt', offset: 10, limit: 20 });
+  const b = mkAgent(base);
+  for (let i = 0; i < 3; i++) b.call('Read', { file_path: 'a.txt' });
+  assert.ok(markerCount(g.agent, '原样执行') > 0, '相同 Grep 应判重复');
+  assert.ok(markerCount(r.agent, '原样执行') > 0, '同文件同区间 Read 应判重复');
+  assert.equal(markerCount(b.agent, '原样执行'), 0, '裸 Read 不得判重复');
+});
+
 await Promise.all(pending);
 
 console.log();

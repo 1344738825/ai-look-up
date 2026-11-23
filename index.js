@@ -213,7 +213,7 @@ const adaptiveStats = new Map();
  */
 const lessonsLedger = new Map();
 
-function registerLesson(pattern, correction, raw = '') {
+function registerLesson(pattern, correction, raw = '', editsAt = null) {
   if (!pattern) return;
   const now = Date.now();
   const cleanRaw = raw ? rawCmd(raw) : '';
@@ -223,12 +223,38 @@ function registerLesson(pattern, correction, raw = '') {
     prev.correction = correction;
     prev.lastSeen = now;
     if (cleanRaw) prev.lastRaw = cleanRaw;
+    if (editsAt !== null && editsAt !== undefined) prev.editsAt = Number(editsAt);
   } else {
-    lessonsLedger.set(pattern, { pattern, correction, hits: 1, lastSeen: now, lastRaw: cleanRaw });
+    const item = { pattern, correction, hits: 1, lastSeen: now, lastRaw: cleanRaw };
+    if (editsAt !== null && editsAt !== undefined) item.editsAt = Number(editsAt);
+    lessonsLedger.set(pattern, item);
   }
 }
 
-function checkLessonGuard(cmd, cfg = null) {
+/** 命令跑通 → 对应坑位扣减一次,扣到 0 即移除。账本不再只进不出。 */
+function redeemLesson(cmd, cfg = null) {
+  const c = cfg ?? DEFAULTS;
+  if (!c.lessons) return;
+  const n = normCmd(cmd);
+  if (!n) return;
+  const prev = lessonsLedger.get(n);
+  if (!prev) return;
+  prev.lastRaw = '';
+  prev.hits -= 1;
+  if (prev.hits <= 0) lessonsLedger.delete(n);
+}
+
+/**
+ * 命中坑位后若期间发生过编辑,判定为"修复后验证"→ 把 block 降级为 warn。
+ * currentEdits 为 null(调用方未提供)或账本未记录 editsAt 时行为不变。
+ */
+function guardAction(action, entry, currentEdits) {
+  if (action !== 'block' || currentEdits === null || currentEdits === undefined) return action;
+  if (!entry || entry.editsAt === undefined || entry.editsAt === null) return action;
+  return currentEdits > entry.editsAt ? 'warn' : action;
+}
+
+function checkLessonGuard(cmd, cfg = null, currentEdits = null) {
   const c = cfg ?? DEFAULTS;
   if (!c.enabled || !c.lessons || !c.lessonGuard) return null;
   const n = normCmd(cmd);
@@ -240,10 +266,12 @@ function checkLessonGuard(cmd, cfg = null) {
   const guardHits = Math.max(1, Number(c.lessonGuardHits ?? 2));
   for (const entry of alive) {
     if (r && entry.lastRaw && r === entry.lastRaw) {
-      return { action: 'block', entry };
+      return { action: guardAction('block', entry, currentEdits), entry };
     }
     if (n && entry.pattern === n) {
-      if ((entry.hits || 1) >= guardHits) return { action: 'block', entry };
+      if ((entry.hits || 1) >= guardHits) {
+        return { action: guardAction('block', entry, currentEdits), entry };
+      }
       return { action: 'warn', entry };
     }
   }
@@ -292,6 +320,34 @@ const clipGoal = (goal, head = 120, tail = 80) => {
   if (goal.length <= head + tail) return goal;
   return goal.slice(0, head) + ' … ' + goal.slice(-tail);
 };
+
+// 短确认词:这类回复只是"继续推进"的许可,不构成新任务,不能冲掉初始目标。
+const SHORT_ACKS = new Set([
+  '继续', '好的', '好', '可以', '行', '都做吧', '没问题', '是的', '对',
+  'ok', 'okay', 'yes', 'y', 'go', 'go ahead', 'continue', 'proceed',
+  'sure', 'do it',
+]);
+const PUNCT_RX = /[\s\u3000,，。.!！?？~～、:：;；'"“”‘’()（）\[\]【】]+/g;
+
+function isSubstantiveGoal(text) {
+  const s = String(text ?? '').trim();
+  if (!s) return false;
+  if (s.length < 10 && SHORT_ACKS.has(s.replace(PUNCT_RX, '').toLowerCase())) return false;
+  return true;
+}
+
+/** 双层目标维护:initialGoal 保最初实质任务,goal 只被实质指令覆盖。 */
+function updateGoals(state, text) {
+  const g = String(text ?? '').trim();
+  if (!g) return;
+  const curInitial = state.initialGoal || '';
+  if (!curInitial) {
+    state.initialGoal = g.slice(0, 400);
+  } else if (!isSubstantiveGoal(curInitial) && isSubstantiveGoal(g)) {
+    state.initialGoal = g.slice(0, 400);
+  }
+  if (isSubstantiveGoal(g) || !state.goal) state.goal = g.slice(0, 400);
+}
 
 const localHm = (ts) => new Date(ts).toTimeString().slice(0, 5);
 const minutesSince = (state, now) => Math.max(0, (now - state.startedAt) / 60000);
@@ -364,6 +420,48 @@ function extractCmd(exec) {
   return '';
 }
 
+const SEARCH_ONLY_TOOLS = new Set(['grep', 'glob', 'webfetch', 'websearch', 'search',
+  'grep_search', 'find_by_name', 'find_files']);
+const READ_TOOLS = new Set(['read', 'read_file', 'view_file']);
+const RANGE_KEYS = ['offset', 'limit', 'start_line', 'end_line', 'StartLine', 'EndLine'];
+
+/**
+ * 非 Shell 只读工具的重复签名 [norm, raw];无法判定重复时返回 ['', '']。
+ *
+ * 只对两类生效:A) 搜索/网络/查询类; B) 带显式行号范围的 Read。
+ * 裸 Read(仅 file_path)刻意不参与——它是各宿主最常见的"推进步数"垫脚调用。
+ */
+function nonShellRepeatSig(tool, exec) {
+  const input = exec?.input ?? exec?.arguments ?? exec?.args ?? exec?.toolInput ?? {};
+  if (!input || typeof input !== 'object') return ['', ''];
+  const tLow = String(tool ?? '').toLowerCase();
+  if (SEARCH_ONLY_TOOLS.has(tLow)) {
+    const q = input.pattern ?? input.query ?? input.url ?? input.path ?? '';
+    if (!q) return ['', ''];
+    const norm = tLow + ':' + rawCmd(String(q)).toLowerCase().slice(0, 80);
+    let dumped;
+    try {
+      dumped = JSON.stringify(Object.keys(input).sort()
+        .reduce((o, k) => { o[k] = input[k]; return o; }, {}));
+    } catch {
+      dumped = String(q);
+    }
+    return [norm, tLow + ':' + rawCmd(dumped)];
+  }
+  if (READ_TOOLS.has(tLow)) {
+    if (!RANGE_KEYS.some((k) => input[k] !== undefined && input[k] !== null && input[k] !== '')) {
+      return ['', ''];
+    }
+    const p = extractPath(input).replace(/\\/g, '/').toLowerCase();
+    if (!p) return ['', ''];
+    const rng = RANGE_KEYS.filter((k) => input[k] !== undefined && input[k] !== null)
+      .map((k) => k + '=' + input[k]).join(',');
+    const sig = 'read:' + p + '#' + rng;
+    return [sig, sig];
+  }
+  return ['', ''];
+}
+
 function extractPath(input) {
   if (!input || typeof input !== 'object') return '';
   for (const key of PATH_KEYS) {
@@ -397,6 +495,31 @@ function briefOf(exec, cmd, tool) {
   }
 }
 
+const firstLine80 = (text) => {
+  const s = String(text ?? '').trim();
+  if (!s) return '';
+  return s.split(/\r?\n/)[0].trim().slice(0, 80).replace(/\n/g, ' ');
+};
+
+/**
+ * 从失败结果里提取一行错误摘要(前 80 字),供审查材料直接引用根因。
+ * 顺序:result.error(对象取 .message) → result.message → result.stderr → result.output。
+ */
+function extractErr(result) {
+  if (!result) return '';
+  const candidates = [result.error, result.message, result.stderr, result.output];
+  for (const v of candidates) {
+    if (!v) continue;
+    if (typeof v === 'object') {
+      const inner = v.message ?? v.error ?? v.stderr ?? v.output ?? '';
+      if (inner) return firstLine80(inner);
+      continue;
+    }
+    return firstLine80(v);
+  }
+  return '';
+}
+
 function freshState() {
   const now = Date.now();
   return {
@@ -405,8 +528,12 @@ function freshState() {
     toolCalls: 0, byTool: {},
     edits: 0, editsSinceReminder: 0, callsSinceReminder: 0,
     failStreak: 0, totalFailures: 0,
+    // 夹心式失败:同一归一化命令在无修改、无该命令成功期间的连败 + 穿插只读段数
+    cmdFailNorm: '', cmdFailStreak: 0, cmdFailInterleaves: 0, lastWasCmdFail: false,
     recentCmds: [], recentLog: [],
     goal: '',
+    // 双层目标:initialGoal 保最初实质任务,短确认回复不覆盖
+    initialGoal: '',
     reminders: 0, lastReminderAt: 0, lastFailReminderAt: 0, lastTrigger: '',
     stopBlocks: 0, promptResets: 0, lastClockTickAt: 0, clockTicks: 0,
     reviewInFlight: false, lessonsSig: '',
@@ -422,6 +549,10 @@ function resetStretch(state, cfg, now) {
   state.callsSinceReminder = 0;
   state.editsSinceReminder = 0;
   state.failStreak = 0;
+  state.cmdFailNorm = '';
+  state.cmdFailStreak = 0;
+  state.cmdFailInterleaves = 0;
+  state.lastWasCmdFail = false;
   state.recentCmds = [];
   state.clockInterval = 0;
   // P2-2：reminders 必须在这里清零，否则同一会话累计 maxReminders 次后
@@ -628,17 +759,30 @@ function buildReviewMaterial(state, cfg, now, kind, detail) {
     const fails = run.filter((e) => !e.ok).length;
     const head = (run[0].brief || '无').slice(0, 40);
     const tail = (run[run.length - 1].brief || '').slice(0, 40);
+    let line;
     if (run.length > 1) {
       const mark = fails ? '✗' + fails + '/' + run.length + ', ' : '';
-      return t + '×' + run.length + '(' + mark + head + ' … ' + tail + ')';
+      line = t + '×' + run.length + '(' + mark + head + ' … ' + tail + ')';
+    } else {
+      line = '[' + t + (fails ? ' ✗' : '') + '] ' + head;
     }
-    return '[' + t + (fails ? ' ✗' : '') + '] ' + head;
+    if (fails) {
+      // 失败段带上最后一条错误摘要:审查者不必只凭"某命令失败了"猜根因
+      const lastErr = [...run].reverse().find((e) => e.err)?.err;
+      if (lastErr) line += ' [错误: ' + lastErr + ']';
+    }
+    return line;
   });
   const dist = [...Object.entries(state.byTool)].sort((a, b) => b[1] - a[1]).slice(0, 4)
     .map(([k, v]) => k + '×' + v).join(', ');
+  const ig = state.initialGoal || '';
+  const lg = state.goal || '';
+  const taskLine = (ig && lg && ig !== lg)
+    ? '【任务】' + clipGoal(ig) + ' (当前指令: ' + clipGoal(lg, 60, 40) + ')'
+    : '【任务】' + clipGoal(lg || ig);
   return [
     '【审查材料】触发: ' + kind,
-    '【任务】' + clipGoal(state.goal),
+    taskLine,
     '【统计】' + minutesSince(state, now).toFixed(0) + ' 分钟/' + state.toolCalls
       + ' 次调用/修改 ' + state.edits + ',连败 ' + state.failStreak + ',累计败 '
       + state.totalFailures + '。',
@@ -959,7 +1103,8 @@ export function apply(ctx, config) {
   const guardExec = (exec) => {
     const tool = toolNameOf(exec);
     if (!isShellTool(tool)) return null;
-    const hit = checkLessonGuard(extractCmd(exec), cfg);
+    const currentEdits = exec?.agent ? (stateOf(exec.agent)?.edits ?? null) : null;
+    const hit = checkLessonGuard(extractCmd(exec), cfg, currentEdits);
     if (!hit) return null;
     const { action, entry } = hit;
     if (action === 'block') {
@@ -1005,9 +1150,9 @@ export function apply(ctx, config) {
           const content = event?.data?.content;
           if (Array.isArray(content)) {
             const block = content.find((b) => b?.type === 'text' && typeof b.text === 'string');
-            if (block) st.goal = block.text.slice(0, 400);
+            if (block) updateGoals(st, block.text);
           } else if (typeof event?.data?.text === 'string') {
-            st.goal = event.data.text.slice(0, 400);
+            updateGoals(st, event.data.text);
           }
         } catch { /* goal capture is best-effort */ }
         // 回合里程碑:连续 N 个回合未做全局重规划 → 新回合开始时强制抬头。
@@ -1107,6 +1252,12 @@ export function apply(ctx, config) {
           st.recentCmds.push({ n, r });
           st.recentCmds = st.recentCmds.slice(-cfg.maxRecentCmds);
         }
+      } else {
+        const [sigN, sigR] = nonShellRepeatSig(tool, exec);
+        if (sigN || sigR) {
+          st.recentCmds.push({ n: sigN, r: sigR });
+          st.recentCmds = st.recentCmds.slice(-cfg.maxRecentCmds);
+        }
       }
 
       const isError = result?.isError === true;
@@ -1114,26 +1265,42 @@ export function apply(ctx, config) {
       if (isError) {
         st.failStreak += 1;
         st.totalFailures += 1;
-        st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: false });
+        // 夹心式失败状态机:同归一化命令在无修改、无成功期间的连败 + 穿插只读段
+        const curNorm = isShellTool(tool) ? normCmd(extractCmd(exec)) : '';
+        if (curNorm && curNorm === st.cmdFailNorm) {
+          st.cmdFailStreak += 1;
+        } else {
+          st.cmdFailNorm = curNorm;
+          st.cmdFailStreak = curNorm ? 1 : 0;
+          st.cmdFailInterleaves = 0;
+        }
+        st.lastWasCmdFail = Boolean(curNorm);
+        const failEntry = { tool, brief: briefOf(exec, extractCmd(exec), tool), ok: false };
+        const err = extractErr(result);
+        if (err) failEntry.err = err;
+        st.recentLog.push(failEntry);
         st.recentLog = st.recentLog.slice(-Math.max(cfg.reviewLogFloor, cfg.reviewLogSize));
+        const interleavedHit = st.cmdFailInterleaves >= 2
+          && st.cmdFailStreak >= cfg.failStreakThreshold;
         // ★ v0.8:fail-loop 收编进 fire()。门槛(连败阈值)留在这里,
         //   其余状态维护全部交给 fire()——此前这里是手工复刻(F1 即漏抄)。
         //   冷却基准 lastFailReminderAt 独立于其它触发器,故 cooldownKey 与 stampKey 都指向它。
-        if (st.failStreak >= cfg.failStreakThreshold) {
+        if (st.failStreak >= cfg.failStreakThreshold || interleavedHit) {
+          // 夹心触发时 failStreak 可能被只读成功清零过,对外报数取两者较大值
+          const streak = Math.max(st.failStreak, st.cmdFailStreak);
           let text = fire(st, cfg, now, 'fail-loop', [
-            '🔔 【AI 抬头 · 失败循环】你已连续失败 ' + st.failStreak + ' 次。请勿再用同样的方式重试:',
+            '🔔 【AI 抬头 · 失败循环】你已连续失败 ' + streak + ' 次。请勿再用同样的方式重试:',
             '1. 完整读取最近一次的错误信息,定位根因(而不是只看表面症状);',
             '2. 判断:这是可以修复的问题,还是方法本身不可行?',
             '3. 换方法、修复后再试;若连续两次换方法仍失败,停下来向用户汇报卡点。',
           ].join('\n'), kindCooldown(cfg, 'fail-loop', cfg.failCooldownSec * 1000),
-          st.failStreak, 'lastFailReminderAt', 'lastFailReminderAt');
+          streak, 'lastFailReminderAt', 'lastFailReminderAt');
           if (text) {
             if (st.reminders >= cfg.escalateAfterReminders) {
               text += '\n⚠️ 这已是本会话第 ' + st.reminders + ' 次提醒。请考虑完全放弃当前路径,直接向用户汇报。';
             }
             const rl = reportLine(cfg);
             if (rl) text += '\n' + rl;
-            const streak = st.failStreak;
             deliverOrReview(agent, st, 'fail-loop',
               '连续失败 ' + streak + ' 次', text);
             if (cfg.lessons) {
@@ -1141,15 +1308,39 @@ export function apply(ctx, config) {
               if (lastFail) {
                 registerLesson(normCmd(lastFail.brief) || '未知模式',
                   '连续失败 ' + streak + ' 次后被打断——换方法前请先读错误定位根因,勿重复此方式',
-                  lastFail.brief);
+                  lastFail.brief, st.edits);
               }
             }
             st.failStreak = 0;
+            // 触发即闭环:夹心计数一并归零,下一轮从干净状态重新累计
+            st.cmdFailNorm = '';
+            st.cmdFailStreak = 0;
+            st.cmdFailInterleaves = 0;
+            st.lastWasCmdFail = false;
             return;
           }
         }
       } else {
         st.failStreak = 0;
+        // 成功事件:按工具类型终结夹心连败状态
+        if (isProductiveTool(tool)) {
+          // 有代码修改 → 不是原地盲试,夹心连败计数整体失效
+          st.cmdFailNorm = '';
+          st.cmdFailStreak = 0;
+          st.cmdFailInterleaves = 0;
+          st.lastWasCmdFail = false;
+        } else if (isShellTool(tool)) {
+          // 命令跑通了 → 连败终结,同时从账本里消掉一次对应坑位
+          st.cmdFailNorm = '';
+          st.cmdFailStreak = 0;
+          st.cmdFailInterleaves = 0;
+          st.lastWasCmdFail = false;
+          if (cfg.lessons) redeemLesson(extractCmd(exec), cfg);
+        } else if (st.cmdFailStreak > 0 && st.lastWasCmdFail) {
+          // 只读工具成功:若刚发生同命令失败,记一次"穿插只读段"
+          st.cmdFailInterleaves += 1;
+          st.lastWasCmdFail = false;
+        }
         st.recentLog.push({ tool, brief: briefOf(exec, extractCmd(exec), tool), ok: true });
         // raw window is generous; run-compression happens at material build time
         st.recentLog = st.recentLog.slice(-Math.max(cfg.reviewLogFloor, cfg.reviewLogSize));
@@ -1253,4 +1444,6 @@ export const __test = {
   // 故探针必须能读取/清空，否则用例互相污染）。
   freshState, kindCooldown, adaptiveStats,
   checkLessonGuard, registerLesson, lessonsLedger,
+  redeemLesson, buildReviewMaterial, nonShellRepeatSig,
+  isSubstantiveGoal, updateGoals, extractErr,
 };

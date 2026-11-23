@@ -871,6 +871,180 @@ check("behavior enabled=false → 回合/步数里程碑一并静默",
       probe_enabled_off_milestone() is False)
 
 
+# 12) 任务一：编辑解锁 + 成功消坑（v0.10）
+def _write_lessons(entries):
+    with open(lk.lessons_path(), "w", encoding="utf-8") as f:
+        json.dump(entries, f, ensure_ascii=False)
+
+
+def _read_lessons():
+    try:
+        with open(lk.lessons_path(), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def probe_lesson_edit_unlock():
+    """同一坑位：编辑计数未变化 → 硬拦截；编辑计数已增加 → 降级软预警。"""
+    import time as _t
+    now = _t.time()
+    cfg = _cfg(lessons=True, lesson_guard=True, lesson_guard_hits=2)
+    case = {"pattern": "python fix_probe.py", "correction": "c", "hits": 3,
+            "last_seen": now, "last_raw": "python fix_probe.py", "edits_at": 2}
+    data = {"tool_name": "Bash", "tool_input": {"command": "python fix_probe.py"}}
+    _write_lessons([dict(case)])
+    st_locked = lk.new_state("bel-locked", 1000.0)
+    st_locked["edits"] = 2
+    out_locked = lk.handle_pre_use(cfg, data, st_locked, 1001.0)
+    _write_lessons([dict(case)])
+    st_fixed = lk.new_state("bel-fixed", 1000.0)
+    st_fixed["edits"] = 3
+    out_fixed = lk.handle_pre_use(cfg, data, st_fixed, 1001.0)
+    return (bool(out_locked and out_locked.get("decision") == "block"),
+            bool(out_fixed and out_fixed.get("decision") != "block"
+                 and "坑位预警" in _json.dumps(out_fixed, ensure_ascii=False)))
+
+
+check("task1 编辑解锁：未编辑→block，已编辑→warn",
+      probe_lesson_edit_unlock() == (True, True))
+
+
+def probe_redeem_lesson():
+    """命令成功后坑位 hits 递减，扣到 0 即移出账本。"""
+    import time as _t
+    now = _t.time()
+    cfg = _cfg(lessons=True, repeat_min_calls=10 ** 9, call_nudge_interval=10 ** 9,
+               long_run_min_calls=10 ** 9, step_replan_calls=10 ** 9,
+               round_replan_rounds=10 ** 9)
+    data = {"tool_name": "Bash", "tool_input": {"command": "python fix_probe.py"}}
+    _write_lessons([{"pattern": "python fix_probe.py", "correction": "c",
+                     "hits": 2, "last_seen": now, "last_raw": "python fix_probe.py"}])
+    st = lk.new_state("bred-1", 1000.0)
+    lk.handle_post_use(cfg, data, st, 1001.0)
+    after_one = [(e.get("hits"), "last_raw" in e) for e in _read_lessons()]
+    st2 = lk.new_state("bred-2", 2000.0)
+    lk.handle_post_use(cfg, data, st2, 2001.0)
+    after_two = _read_lessons()
+    return (after_one, after_two)
+
+
+check("task1 成功消坑：hits 2→1(清 last_raw)→移除",
+      probe_redeem_lesson() == ([(1, False)], []))
+
+
+# 13) 任务二：夹心式失败识别
+def _fail_seq(cfg, seq, sid):
+    st = lk.new_state(sid, 1000.0)
+    now = 1000.0
+    outs = []
+    for tool, cmd, fail in seq:
+        now += 60
+        data = {"tool_name": tool,
+                "tool_input": ({"command": cmd} if cmd is not None else {"file_path": "a.txt"})}
+        out = lk.handle_post_fail(cfg, data, st, now) if fail else lk.handle_post_use(cfg, data, st, now)
+        outs.append(_json.dumps(out, ensure_ascii=False) if out else "")
+    return st, outs
+
+
+def probe_interleaved_fail():
+    """夹心循环 Fail→Read→Fail→Read→Fail 第 3 次失败即触发；
+    对照 Fail,Fail,Read,Fail,Fail（只 1 次穿插）不得触发——dsh-smoke #2 红线。"""
+    cfg = _cfg(fail_streak_threshold=3, max_reminders=99, lessons=False,
+               repeat_min_calls=10 ** 9, call_nudge_interval=10 ** 9,
+               long_run_min_calls=10 ** 9, step_replan_calls=10 ** 9,
+               round_replan_rounds=10 ** 9)
+    _, sandwich = _fail_seq(cfg, [
+        ("Bash", "python x.py", True), ("Read", None, False),
+        ("Bash", "python x.py", True), ("Read", None, False),
+        ("Bash", "python x.py", True)], "bif-sandwich")
+    _, control = _fail_seq(cfg, [
+        ("Bash", "python x.py", True), ("Bash", "python x.py", True),
+        ("Read", None, False), ("Bash", "python x.py", True),
+        ("Bash", "python x.py", True)], "bif-control")
+    return (_count(sandwich, "失败循环"), _count(control, "失败循环"))
+
+
+check("task2 夹心失败：3 次失败(穿插 2 段只读)触发，单段穿插不触发",
+      probe_interleaved_fail() == (1, 0))
+
+
+# 14) 任务三：双层目标保留 + 失败日志错误摘要
+def probe_dual_goal():
+    """长指令 → "继续"：初始任务与当前指令都不被冲掉；
+    再来一条实质指令时才出现"(当前指令: …)"；单轮任务格式与旧版一致。"""
+    cfg = _cfg(lessons=False)
+    long_goal = "重构订单幂等模块并补齐单元测试"
+    st = lk.new_state("bdg-dual", 1000.0)
+    lk.handle_prompt(cfg, {"prompt": long_goal}, st, 1001.0)
+    lk.handle_prompt(cfg, {"prompt": "继续"}, st, 1002.0)
+    material = lk.build_review_material(st, cfg, 1003.0, "no-output", "")
+    kept = (long_goal in material and st.get("last_goal") == long_goal)
+    # 第二条实质指令:初始任务保留,当前指令并列展示
+    lk.handle_prompt(cfg, {"prompt": "另外补一版性能压测报告"}, st, 1004.0)
+    switched = lk.build_review_material(st, cfg, 1005.0, "no-output", "")
+    dual = (long_goal in switched and "(当前指令: 另外补一版性能压测报告)" in switched)
+    single = lk.new_state("bdg-single", 2000.0)
+    lk.handle_prompt(cfg, {"prompt": long_goal}, single, 2001.0)
+    single_material = lk.build_review_material(single, cfg, 2002.0, "no-output", "")
+    single_ok = ("当前指令" not in single_material
+                 and ("【任务】" + long_goal) in single_material)
+    return (kept, dual, single_ok)
+
+
+check("task3 双层目标：短确认不冲掉初始任务，换任务并列展示，单轮格式不变",
+      probe_dual_goal() == (True, True, True))
+
+
+def probe_fail_err():
+    """失败事件带 error 时，审查材料追加 [错误: ...]，只取首行且 ≤80 字。"""
+    cfg = _cfg(fail_streak_threshold=1, lessons=False, max_reminders=99)
+    st = lk.new_state("berr", 1000.0)
+    lk.handle_post_fail(cfg, {
+        "tool_name": "Bash", "tool_input": {"command": "python app.py"},
+        "error": "ModuleNotFoundError: No module named foo\nTraceback (most recent call last):"},
+        st, 1001.0)
+    material = lk.build_review_material(st, cfg, 1002.0, "fail-loop", "")
+    line = next((ln for ln in material.splitlines() if "[错误:" in ln), "")
+    return ("ModuleNotFoundError: No module named foo" in material,
+            "Traceback" not in material,
+            len(line) <= 200)
+
+
+check("task3 错误摘要：材料含 error 首行、不含堆栈后续行",
+      probe_fail_err() == (True, True, True))
+
+
+# 15) 任务四：非 Bash 只读工具的重复空转
+def _post_use_seq(cfg, seq, sid):
+    st = lk.new_state(sid, 1000.0)
+    now = 1000.0
+    outs = []
+    for tool, ti in seq:
+        now += 1
+        out = lk.handle_post_use(cfg, {"tool_name": tool, "tool_input": ti}, st, now)
+        outs.append(_json.dumps(out, ensure_ascii=False) if out else "")
+    return st, outs
+
+
+def probe_non_shell_repeat():
+    """相同 Grep ×3 与同文件同区间 Read ×3 判重复；裸 Read ×3 不判重复。"""
+    cfg = _cfg(repeat_min_calls=0, repeat_cmd_count=3, repeat_window=5,
+               call_nudge_interval=10 ** 9, long_run_min_calls=10 ** 9,
+               step_replan_calls=10 ** 9, round_replan_rounds=10 ** 9,
+               lessons=False)
+    _, grep_outs = _post_use_seq(cfg, [("Grep", {"pattern": "TODO"})] * 3, "bns-grep")
+    _, bare_outs = _post_use_seq(cfg, [("Read", {"file_path": "a.txt"})] * 3, "bns-bare")
+    _, range_outs = _post_use_seq(
+        cfg, [("Read", {"file_path": "a.txt", "offset": 10, "limit": 20})] * 3, "bns-range")
+    return (_count(grep_outs, "原样执行"), _count(bare_outs, "原样执行"),
+            _count(range_outs, "原样执行"))
+
+
+check("task4 只读重复：同 Grep/同区间 Read 触发，裸 Read 静默",
+      probe_non_shell_repeat() == (1, 0, 1))
+
+
 print()
 print("golden_check.py: %s" % ("ALL PASSED" if fails == 0 else "%d FAILURES" % fails))
 sys.exit(0 if fails == 0 else 1)
